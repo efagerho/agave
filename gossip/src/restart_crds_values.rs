@@ -225,7 +225,6 @@ mod test {
             crds_value::{CrdsValue, CrdsValueLabel},
             protocol::MAX_CRDS_OBJECT_SIZE,
         },
-        bincode::serialized_size,
         solana_keypair::Keypair,
         solana_signer::Signer,
         solana_time_utils::timestamp,
@@ -253,7 +252,8 @@ mod test {
         // If the following assert fails, please update RestartLastVotedForkSlots::MAX_BYTES
         assert_eq!(
             RestartLastVotedForkSlots::MAX_BYTES,
-            MAX_CRDS_OBJECT_SIZE - serialized_size(&header).unwrap() as usize
+            // TODO: bincode
+            MAX_CRDS_OBJECT_SIZE - bincode::serialized_size(&header).unwrap() as usize
         );
 
         // Create large enough slots to make sure we are discarding some to make slots fit.
@@ -268,7 +268,8 @@ mod test {
             0,
         )
         .unwrap();
-        assert!(serialized_size(&large_slots).unwrap() <= MAX_CRDS_OBJECT_SIZE as u64);
+        // TODO: bincode
+        assert!(bincode::serialized_size(&large_slots).unwrap() <= MAX_CRDS_OBJECT_SIZE as u64);
         let retrieved_slots = large_slots.to_slots(0);
         assert!(retrieved_slots.len() <= range.len());
         assert!(retrieved_slots.last().unwrap() - retrieved_slots.first().unwrap() > 5000);
@@ -322,7 +323,8 @@ mod test {
             shred_version,
         )
         .unwrap();
-        assert!(serialized_size(&large_slots).unwrap() < MAX_CRDS_OBJECT_SIZE as u64);
+        // TODO: bincode
+        assert!(bincode::serialized_size(&large_slots).unwrap() < MAX_CRDS_OBJECT_SIZE as u64);
         let retrieved_slots = large_slots.to_slots(0);
         assert_eq!(retrieved_slots, large_slots_vec);
     }

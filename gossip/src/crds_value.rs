@@ -6,7 +6,6 @@ use {
         epoch_slots::EpochSlots,
     },
     arrayvec::ArrayVec,
-    bincode::serialize,
     rand::Rng,
     serde::{Deserialize, Serialize, de::Deserializer},
     solana_hash::Hash,
@@ -42,7 +41,8 @@ impl Signable for CrdsValue {
     }
 
     fn signable_data(&self) -> Cow<'static, [u8]> {
-        Cow::Owned(serialize(&self.data).expect("failed to serialize CrdsData"))
+        // TODO: bincode
+        Cow::Owned(bincode::serialize(&self.data).expect("failed to serialize CrdsData"))
     }
 
     fn get_signature(&self) -> Signature {
@@ -102,8 +102,11 @@ impl CrdsValueLabel {
 
 impl CrdsValue {
     pub fn new(data: CrdsData, keypair: &Keypair) -> Self {
+        // TODO: bincode
         let bincode_serialized_data = bincode::serialize(&data).unwrap();
+        // TODO: bincode
         let signature = keypair.sign_message(&bincode_serialized_data);
+        // TODO: bincode
         let hash = solana_sha256_hasher::hashv(&[signature.as_ref(), &bincode_serialized_data]);
         Self {
             signature,
@@ -114,8 +117,10 @@ impl CrdsValue {
 
     #[cfg(test)]
     pub(crate) fn new_unsigned(data: CrdsData) -> Self {
+        // TODO: bincode
         let bincode_serialized_data = bincode::serialize(&data).unwrap();
         let signature = Signature::default();
+        // TODO: bincode
         let hash = solana_sha256_hasher::hashv(&[signature.as_ref(), &bincode_serialized_data]);
         Self {
             signature,
@@ -201,8 +206,11 @@ impl CrdsValue {
         Some(epoch_slots)
     }
 
+    // TODO: bincode
     /// Returns the bincode serialized size (in bytes) of the CrdsValue.
+    // TODO: bincode
     pub fn bincode_serialized_size(&self) -> usize {
+        // TODO: bincode
         bincode::serialized_size(&self)
             .map(usize::try_from)
             .unwrap()
@@ -227,6 +235,7 @@ impl<'de> Deserialize<'de> for CrdsValue {
         // PACKET_DATA_SIZE is always enough since we have just received the value in a packet
         // ArrayVec allows us to write serialized data into stack memory without initializing it
         let mut buffer = ArrayVec::<u8, PACKET_DATA_SIZE>::new();
+        // TODO: bincode
         bincode::serialize_into(&mut buffer, &data).map_err(serde::de::Error::custom)?;
         let hash = solana_sha256_hasher::hashv(&[signature.as_ref(), &buffer]);
         Ok(Self {
@@ -242,7 +251,6 @@ mod test {
     use {
         super::*,
         crate::crds_data::{LowestSlot, Vote},
-        bincode::deserialize,
         rand::SeedableRng as _,
         rand_chacha::ChaChaRng,
         solana_keypair::Keypair,
@@ -309,8 +317,10 @@ mod test {
         value.sign(keypair);
         let original_signature = value.get_signature();
         for _ in 0..num_tries {
-            let serialized_value = serialize(value).unwrap();
-            let deserialized_value: CrdsValue = deserialize(&serialized_value).unwrap();
+            // TODO: bincode
+            let serialized_value = bincode::serialize(value).unwrap();
+            // TODO: bincode
+            let deserialized_value: CrdsValue = bincode::deserialize(&serialized_value).unwrap();
 
             // Signatures shouldn't change
             let deserialized_signature = deserialized_value.get_signature();
@@ -406,6 +416,7 @@ mod test {
                 CrdsValue::new(CrdsData::Vote(5, vote), &keypair)
             },
         ];
+        // TODO: bincode
         let bytes = bincode::serialize(&values).unwrap();
         // Serialized bytes are fixed and should never change.
         assert_eq!(
@@ -414,6 +425,7 @@ mod test {
         );
         // serialize -> deserialize should round trip.
         assert_eq!(
+            // TODO: bincode
             bincode::deserialize::<Vec<CrdsValue>>(&bytes).unwrap(),
             values
         );

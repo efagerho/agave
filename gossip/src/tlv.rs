@@ -3,6 +3,7 @@ use {
     solana_short_vec as short_vec,
 };
 
+// TODO: bincode
 /// Type-Length-Value encoding wrapper for bincode
 #[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
 pub(crate) struct TlvRecord {
@@ -49,6 +50,7 @@ macro_rules! define_tlv_enum {
             fn try_from(value: &TlvRecord) -> Result<Self, Self::Error> {
                 match value.typ {
                     $(
+                        // TODO: bincode
                         $typ => Ok(Self::$variant(bincode::deserialize::<$inner>(&value.bytes)?)),
                     )*
                     _ => Err(TlvDecodeError::UnknownType(value.typ)),
@@ -57,6 +59,7 @@ macro_rules! define_tlv_enum {
         }
         // define conversion into TLV wire format
         impl TryFrom<&$enum_name> for TlvRecord {
+            // TODO: bincode
             type Error = bincode::Error;
             fn try_from(value: &$enum_name) -> Result<Self, Self::Error> {
                 use serde::ser::Error;
@@ -64,10 +67,12 @@ macro_rules! define_tlv_enum {
                     $(
                         $enum_name::$variant(inner) => Ok(TlvRecord {
                             typ: $typ,
+                            // TODO: bincode
                             bytes: bincode::serialize(inner)?,
                         }),
                     )*
                     #[allow(unreachable_patterns)]
+                    // TODO: bincode
                     _ => Err(bincode::Error::custom("Unsupported enum variant")),
                 }
             }
@@ -80,6 +85,7 @@ pub enum TlvDecodeError {
     #[error("Unknown type: {0}")]
     UnknownType(u8),
     #[error("Malformed payload: {0}")]
+    // TODO: bincode
     MalformedPayload(#[from] bincode::Error),
 }
 
@@ -114,7 +120,9 @@ mod tests {
             ExtensionNew::NewString(String::from("bla")),
         ];
 
+        // TODO: bincode
         let new_bytes = bincode::serialize(&new_tlv_data).unwrap();
+        // TODO: bincode
         let tlv_vec: Vec<TlvRecord> = bincode::deserialize(&new_bytes).unwrap();
         // check that both TLV are encoded correctly
         let new: Vec<ExtensionNew> = crate::tlv::parse(&tlv_vec);
@@ -143,8 +151,10 @@ mod tests {
             ExtensionLegacy::Test(42),
             ExtensionLegacy::LegacyString(String::from("foo")),
         ];
+        // TODO: bincode
         let legacy_bytes = bincode::serialize(&legacy_tlv_data).unwrap();
 
+        // TODO: bincode
         let tlv_vec: Vec<TlvRecord> = bincode::deserialize(&legacy_bytes).unwrap();
         // Just in case make sure that legacy data is serialized correctly
         let legacy: Vec<ExtensionLegacy> = crate::tlv::parse(&tlv_vec);

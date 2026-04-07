@@ -315,6 +315,7 @@ impl ClusterInfo {
         match File::create(tmp_filename) {
             Ok(file) => {
                 let mut writer = BufWriter::new(file);
+                // TODO: bincode
                 if let Err(err) = bincode::serialize_into(&mut writer, &nodes) {
                     warn!(
                         "Failed to serialize contact info info {}: {}",
@@ -363,6 +364,7 @@ impl ClusterInfo {
 
         let nodes: Vec<CrdsValue> = match File::open(&filename) {
             Ok(file) => {
+                // TODO: bincode
                 bincode::deserialize_from(&mut BufReader::new(file)).unwrap_or_else(|err| {
                     warn!("Failed to deserialize {}: {}", filename.display(), err);
                     vec![]
@@ -2555,7 +2557,6 @@ mod tests {
             protocol::tests::new_rand_remote_node,
             socketaddr,
         },
-        bincode::serialize,
         itertools::izip,
         solana_keypair::Keypair,
         solana_ledger::shred::Shredder,
@@ -2752,9 +2753,11 @@ mod tests {
             pongs.into_iter()
         ) {
             assert_eq!(packet.meta().socket_addr(), socket);
-            let bytes = serialize(&pong).unwrap();
+            // TODO: bincode
+            let bytes = bincode::serialize(&pong).unwrap();
             match packet.deserialize_slice(..).unwrap() {
-                Protocol::PongMessage(pong) => assert_eq!(serialize(&pong).unwrap(), bytes),
+                // TODO: bincode
+                Protocol::PongMessage(pong) => assert_eq!(bincode::serialize(&pong).unwrap(), bytes),
                 _ => panic!("invalid packet!"),
             }
         }

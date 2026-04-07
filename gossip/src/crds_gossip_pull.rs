@@ -616,6 +616,7 @@ impl Index<&Pubkey> for CrdsTimeouts<'_> {
     }
 }
 
+// TODO: bincode
 // Returns max_bytes for the bloom filter such that bincode serialized
 // Protocol::PullRequest(CrdsFilter, CrdsValue) fits in a packet.
 pub(crate) fn get_max_bloom_filter_bytes(caller: &CrdsValue) -> usize {
@@ -628,6 +629,7 @@ pub(crate) fn get_max_bloom_filter_bytes(caller: &CrdsValue) -> usize {
             let mut iter = Vec::<CrdsFilter>::from(filters)
                 .into_iter()
                 .map(|filter| {
+                    // TODO: bincode
                     bincode::serialized_size(&filter)
                         .map(usize::try_from)
                         .unwrap()
@@ -648,11 +650,13 @@ pub(crate) fn get_max_bloom_filter_bytes(caller: &CrdsValue) -> usize {
         });
         out
     });
+    // TODO: bincode
     // Maximum bincode serialized size of CrdsFilter in
     // Protocol::PullRequest(CrdsFilter, CrdsValue)
     let size_of_filter = PACKET_DATA_SIZE
         .checked_sub(
             // 4 bytes for u32 enum variant identifier of Protocol.
+            // TODO: bincode
             4 + caller.bincode_serialized_size(),
         )
         .unwrap();
@@ -1436,6 +1440,7 @@ pub(crate) mod tests {
         )
     }
 
+    // TODO: bincode
     // Asserts that all bincode serialized pull requests fit in a Packet.
     fn verify_get_max_bloom_filter_bytes<R: Rng>(
         rng: &mut R,
@@ -1445,10 +1450,13 @@ pub(crate) mod tests {
         let packet_data_size_range = (PACKET_DATA_SIZE - 7)..=PACKET_DATA_SIZE;
         let max_bytes = get_max_bloom_filter_bytes(caller);
         let filters = CrdsFilterSet::new(rng, num_items, max_bytes);
+        // TODO: bincode
         let request_bytes = caller.bincode_serialized_size() as u64;
         for filter in Vec::<CrdsFilter>::from(filters) {
+            // TODO: bincode
             let request_bytes = 4 + request_bytes + bincode::serialized_size(&filter).unwrap();
             let request = Protocol::PullRequest(filter, caller.clone());
+            // TODO: bincode
             let request = bincode::serialize(&request).unwrap();
             assert!(packet_data_size_range.contains(&request.len()));
             assert_eq!(request.len() as u64, request_bytes);

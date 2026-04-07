@@ -18,6 +18,7 @@ mod tests {
     }
 
     fn serialize<T: Serialize>(pkt: T) -> Vec<u8> {
+        // TODO: bincode
         bincode::serialize(&pkt).unwrap()
     }
 

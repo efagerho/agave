@@ -961,7 +961,9 @@ mod tests {
                 .is_ok()
             );
             // Assert that serde round trips.
+            // TODO: bincode
             let bytes = bincode::serialize(&node).unwrap();
+            // TODO: bincode
             let other: ContactInfo = bincode::deserialize(&bytes).unwrap();
             assert_eq!(node, other);
         }

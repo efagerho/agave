@@ -3,7 +3,6 @@ use {
         crds_data::{self, MAX_SLOT, MAX_WALLCLOCK},
         protocol::MAX_CRDS_OBJECT_SIZE,
     },
-    bincode::serialized_size,
     bv::BitVec,
     flate2::{Compress, Compression, Decompress, FlushCompress, FlushDecompress},
     serde::{Deserialize, Serialize},
@@ -340,8 +339,10 @@ impl EpochSlots {
         Ok(())
     }
     pub fn max_compressed_slot_size(&self) -> isize {
-        let len_header = serialized_size(self).unwrap();
-        let len_slot = serialized_size(&CompressedSlots::default()).unwrap();
+        // TODO: bincode
+        let len_header = bincode::serialized_size(self).unwrap();
+        // TODO: bincode
+        let len_slot = bincode::serialized_size(&CompressedSlots::default()).unwrap();
         MAX_CRDS_OBJECT_SIZE as isize - (len_header + len_slot) as isize
     }
 

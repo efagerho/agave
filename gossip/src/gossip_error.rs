@@ -20,6 +20,7 @@ pub enum GossipError {
     #[error("send error")]
     SendError,
     #[error("serialization error")]
+    // TODO: bincode
     Serialize(#[from] Box<bincode::ErrorKind>),
 }
 

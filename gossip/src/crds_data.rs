@@ -501,6 +501,7 @@ mod test {
     use {
         super::*,
         crate::crds_value::CrdsValue,
+        // TODO: bincode
         bincode::Options,
         solana_keypair::Keypair,
         solana_perf::test_tx::new_test_vote_tx,
@@ -567,11 +568,15 @@ mod test {
         )
         .unwrap();
         assert_eq!(vote.slot, Some(7));
+        // TODO: bincode
         let bytes = bincode::serialize(&vote).unwrap();
+        // TODO: bincode
         let other = bincode::deserialize(&bytes[..]).unwrap();
         assert_eq!(vote, other);
         assert_eq!(other.slot, Some(7));
+        // TODO: bincode
         let bytes = bincode::options().serialize(&vote).unwrap();
+        // TODO: bincode
         let other = bincode::options().deserialize(&bytes[..]).unwrap();
         assert_eq!(vote, other);
         assert_eq!(other.slot, Some(7));
@@ -601,7 +606,9 @@ mod test {
             timestamp: 0,
             token: 0,
         });
+        // TODO: bincode
         let bytes = bincode::serialize(&node_instance).unwrap();
+        // TODO: bincode
         assert!(bincode::deserialize::<CrdsData>(&bytes[..]).is_err());
 
         #[derive(serde::Serialize)]
@@ -613,6 +620,7 @@ mod test {
         }
 
         let legacy_v1: solana_version::v1::Version = {
+            // TODO: bincode
             let bytes = bincode::serialize(&LegacyVersion1Mirror {
                 major: 0,
                 minor: 0,
@@ -620,6 +628,7 @@ mod test {
                 commit: None,
             })
             .unwrap();
+            // TODO: bincode
             bincode::deserialize(&bytes).unwrap()
         };
 
@@ -629,7 +638,9 @@ mod test {
             wallclock: timestamp(),
             version: legacy_v1,
         });
+        // TODO: bincode
         let bytes = bincode::serialize(&legacy_version).unwrap();
+        // TODO: bincode
         assert!(bincode::deserialize::<CrdsData>(&bytes[..]).is_err());
 
         // Version
@@ -638,38 +649,50 @@ mod test {
             wallclock: timestamp(),
             version: solana_version::v2::Version::default(),
         });
+        // TODO: bincode
         let bytes = bincode::serialize(&version).unwrap();
+        // TODO: bincode
         assert!(bincode::deserialize::<CrdsData>(&bytes[..]).is_err());
 
         // LegacyContactInfo
         let legacy_contact_info = CrdsData::LegacyContactInfo(LegacyContactInfo::default());
+        // TODO: bincode
         let bytes = bincode::serialize(&legacy_contact_info).unwrap();
+        // TODO: bincode
         assert!(bincode::deserialize::<CrdsData>(&bytes[..]).is_err());
 
         // AccountsHashes
         let mut rng = rand::rng();
         let accounts_hashes =
             CrdsData::AccountsHashes(AccountsHashes::new_rand(&mut rng, Some(keypair.pubkey())));
+        // TODO: bincode
         let bytes = bincode::serialize(&accounts_hashes).unwrap();
+        // TODO: bincode
         assert!(bincode::deserialize::<CrdsData>(&bytes[..]).is_err());
 
         // LegacySnapshotHashes
         let legacy_snapshot_hashes = CrdsData::LegacySnapshotHashes(
             LegacySnapshotHashes::new_rand(&mut rng, Some(keypair.pubkey())),
         );
+        // TODO: bincode
         let bytes = bincode::serialize(&legacy_snapshot_hashes).unwrap();
+        // TODO: bincode
         assert!(bincode::deserialize::<CrdsData>(&bytes[..]).is_err());
 
         // LowestSlot(1, ...)
         let lowest_slot =
             CrdsData::LowestSlot(1, LowestSlot::new(keypair.pubkey(), 0, timestamp()));
+        // TODO: bincode
         let bytes = bincode::serialize(&lowest_slot).unwrap();
+        // TODO: bincode
         assert!(bincode::deserialize::<CrdsData>(&bytes[..]).is_err());
 
         // LowestSlot(0, ...) -> should be deserialized successfully
         let lowest_slot =
             CrdsData::LowestSlot(0, LowestSlot::new(keypair.pubkey(), 0, timestamp()));
+        // TODO: bincode
         let bytes = bincode::serialize(&lowest_slot).unwrap();
+        // TODO: bincode
         assert!(bincode::deserialize::<CrdsData>(&bytes[..]).is_ok());
     }
 }

@@ -367,10 +367,12 @@ pub(crate) mod tests {
             _unused: 0,
         };
         assert_eq!(
+            // TODO: bincode
             bincode::serialize(&dup).unwrap().len(),
             DUPLICATE_SHRED_HEADER_SIZE
         );
         assert_eq!(
+            // TODO: bincode
             bincode::serialized_size(&dup).unwrap(),
             DUPLICATE_SHRED_HEADER_SIZE as u64
         );
