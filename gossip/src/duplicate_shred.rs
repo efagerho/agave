@@ -1,6 +1,7 @@
 use {
     crate::crds_data::sanitize_wallclock,
     itertools::Itertools,
+    rand::Rng,
     serde::{Deserialize, Serialize},
     solana_clock::Slot,
     solana_ledger::{
@@ -8,7 +9,7 @@ use {
         blockstore_meta::{DuplicateSlotProof, ErasureMeta},
         shred::{self, Shred, ShredType},
     },
-    solana_pubkey::Pubkey,
+    solana_pubkey::{self, Pubkey},
     solana_sanitize::{Sanitize, SanitizeError},
     std::{
         collections::{HashMap, hash_map::Entry},
@@ -50,6 +51,19 @@ impl DuplicateShred {
     #[inline]
     pub(crate) fn chunk_index(&self) -> u8 {
         self.chunk_index
+    }
+
+    pub(crate) fn new_rand<R: Rng>(rng: &mut R, pubkey: Option<Pubkey>) -> Self {
+        DuplicateShred {
+            from: pubkey.unwrap_or_else(solana_pubkey::new_rand),
+            wallclock: crate::crds_data::new_rand_timestamp(rng),
+            slot: rng.random_range(0..1_000_000),
+            _unused: 0,
+            _unused_shred_type: 0,
+            num_chunks: 1,
+            chunk_index: 0,
+            chunk: vec![0u8; 32],
+        }
     }
 }
 

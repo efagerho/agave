@@ -7,6 +7,7 @@ use {
         legacy_contact_info::LegacyContactInfo,
         restart_crds_values::{RestartHeaviestFork, RestartLastVotedForkSlots},
     },
+    bincode,
     rand::Rng,
     serde::{Deserialize, Serialize, de::Deserializer},
     solana_clock::Slot,
@@ -138,6 +139,46 @@ impl CrdsData {
                 EpochSlots::new_rand(rng, pubkey),
             ),
         }
+    }
+
+    /// One instance of every CrdsData variant for use in testing and bombardment.
+    ///
+    /// `shred_version` must match the target cluster so that the `ContactInfo`
+    /// entry passes the receiving node's shred-version filter and our pubkey
+    /// becomes known in its CRDS.
+    pub(crate) fn make_all_crds_data<R: Rng>(
+        rng: &mut R,
+        pubkey: Pubkey,
+        shred_version: u16,
+    ) -> Vec<CrdsData> {
+        let wallclock = timestamp();
+        vec![
+            // ContactInfo must come first and carry the correct shred_version
+            // so the target node admits our pubkey into its CRDS, which is
+            // the prerequisite for all other variant types to be accepted.
+            CrdsData::from(ContactInfo::new(pubkey, wallclock, shred_version)),
+            CrdsData::LegacyContactInfo(LegacyContactInfo::new_rand(rng, Some(pubkey))),
+            CrdsData::Vote(0, Vote::new_rand(rng, Some(pubkey))),
+            CrdsData::LowestSlot(0, LowestSlot::new(pubkey, 0, wallclock)),
+            CrdsData::LegacySnapshotHashes(AccountsHashes::new_rand(rng, Some(pubkey))),
+            CrdsData::AccountsHashes(AccountsHashes::new_rand(rng, Some(pubkey))),
+            CrdsData::EpochSlots(0, EpochSlots::new(pubkey, wallclock)),
+            CrdsData::LegacyVersion(LegacyVersion::new_rand(rng, Some(pubkey))),
+            CrdsData::Version(Version::new_rand(rng, Some(pubkey))),
+            CrdsData::NodeInstance(NodeInstance::new_rand(rng, Some(pubkey))),
+            CrdsData::DuplicateShred(0, DuplicateShred::new_rand(rng, Some(pubkey))),
+            CrdsData::SnapshotHashes(SnapshotHashes {
+                from: pubkey,
+                full: (100, Hash::default()),
+                incremental: vec![],
+                wallclock,
+            }),
+            CrdsData::RestartLastVotedForkSlots(
+                RestartLastVotedForkSlots::new(pubkey, wallclock, &[1, 2, 3], Hash::default(), 0)
+                    .unwrap(),
+            ),
+            CrdsData::RestartHeaviestFork(RestartHeaviestFork::new_rand(rng, Some(pubkey))),
+        ]
     }
 
     pub(crate) fn wallclock(&self) -> u64 {
@@ -431,6 +472,31 @@ pub(crate) struct LegacyVersion {
 }
 reject_deserialize!(LegacyVersion, "LegacyVersion is deprecated");
 
+impl LegacyVersion {
+    pub(crate) fn new_rand<R: Rng>(rng: &mut R, pubkey: Option<Pubkey>) -> Self {
+        // v1::Version has private fields; construct via bincode round-trip.
+        #[derive(Serialize)]
+        struct V1Mirror {
+            major: u16,
+            minor: u16,
+            patch: u16,
+            commit: Option<u32>,
+        }
+        let bytes = bincode::serialize(&V1Mirror {
+            major: 1,
+            minor: 18,
+            patch: 11,
+            commit: None,
+        })
+        .unwrap();
+        LegacyVersion {
+            from: pubkey.unwrap_or_else(solana_pubkey::new_rand),
+            wallclock: new_rand_timestamp(rng),
+            version: bincode::deserialize(&bytes).unwrap(),
+        }
+    }
+}
+
 impl Sanitize for LegacyVersion {
     fn sanitize(&self) -> Result<(), SanitizeError> {
         sanitize_wallclock(self.wallclock)?;
@@ -447,6 +513,16 @@ pub(crate) struct Version {
     version: solana_version::v2::Version,
 }
 reject_deserialize!(Version, "Version is deprecated");
+
+impl Version {
+    pub(crate) fn new_rand<R: Rng>(rng: &mut R, pubkey: Option<Pubkey>) -> Self {
+        Version {
+            from: pubkey.unwrap_or_else(solana_pubkey::new_rand),
+            wallclock: new_rand_timestamp(rng),
+            version: solana_version::v2::Version::default(),
+        }
+    }
+}
 
 impl Sanitize for Version {
     fn sanitize(&self) -> Result<(), SanitizeError> {
@@ -465,6 +541,17 @@ pub(crate) struct NodeInstance {
     token: u64,     // Randomly generated value at node instantiation.
 }
 reject_deserialize!(NodeInstance, "NodeInstance is deprecated");
+
+impl NodeInstance {
+    pub(crate) fn new_rand<R: Rng>(rng: &mut R, pubkey: Option<Pubkey>) -> Self {
+        NodeInstance {
+            from: pubkey.unwrap_or_else(solana_pubkey::new_rand),
+            wallclock: new_rand_timestamp(rng),
+            timestamp: new_rand_timestamp(rng),
+            token: rng.random(),
+        }
+    }
+}
 
 impl Sanitize for NodeInstance {
     fn sanitize(&self) -> Result<(), SanitizeError> {

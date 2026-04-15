@@ -9,6 +9,7 @@
 #![warn(unsafe_attr_outside_unsafe)]
 #![warn(unsafe_op_in_unsafe_fn)]
 
+pub mod bombard;
 pub mod cluster_info;
 pub mod cluster_info_metrics;
 pub mod contact_info;

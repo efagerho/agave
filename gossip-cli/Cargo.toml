@@ -23,6 +23,7 @@ clap = { workspace = true }
 log = { workspace = true }
 solana-clap-utils = { workspace = true }
 solana-gossip = { workspace = true, features = ["agave-unstable-api"] }
+solana-keypair = { workspace = true }
 solana-net-utils = { workspace = true, features = ["agave-unstable-api"] }
 solana-pubkey = { version = "=4.2.0", features = ["rand"] }
 solana-version = { workspace = true }

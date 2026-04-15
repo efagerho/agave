@@ -22,6 +22,10 @@ use {
     },
 };
 
+fn is_u64(v: String) -> Result<(), String> {
+    v.parse::<u64>().map(|_| ()).map_err(|e| format!("{e}"))
+}
+
 fn get_clap_app<'ab, 'v>(name: &str, about: &'ab str, version: &'v str) -> App<'ab, 'v> {
     let shred_version_arg = Arg::with_name("shred_version")
         .long("shred-version")
@@ -93,6 +97,60 @@ fn get_clap_app<'ab, 'v>(name: &str, about: &'ab str, version: &'v str) -> App<'
                 .arg(&gossip_port_arg)
                 .arg(&bind_address_arg)
                 .setting(AppSettings::DisableVersion),
+        )
+        .subcommand(
+            SubCommand::with_name("bombard")
+                .about("Bombard a gossip endpoint with all CrdsData message types")
+                .setting(AppSettings::DisableVersion)
+                .arg(
+                    Arg::with_name("endpoint")
+                        .short("e")
+                        .long("endpoint")
+                        .value_name("HOST:PORT")
+                        .takes_value(true)
+                        .required(true)
+                        .validator(solana_net_utils::is_host_port)
+                        .help("Target gossip endpoint to bombard"),
+                )
+                .arg(
+                    Arg::with_name("identity")
+                        .short("i")
+                        .long("identity")
+                        .value_name("PATH")
+                        .takes_value(true)
+                        .validator(is_keypair_or_ask_keyword)
+                        .help("Signing keypair [default: ephemeral keypair]"),
+                )
+                .arg(
+                    Arg::with_name("shred_version")
+                        .long("shred-version")
+                        .value_name("VERSION")
+                        .takes_value(true)
+                        .default_value("0")
+                        .help(
+                            "Cluster shred version required for ContactInfo to be accepted \
+                             [default: auto-detect from endpoint]",
+                        ),
+                )
+                .arg(
+                    Arg::with_name("count")
+                        .short("c")
+                        .long("count")
+                        .value_name("NUM")
+                        .takes_value(true)
+                        .validator(is_u64)
+                        .help("Number of bombardment rounds [default: infinite]"),
+                )
+                .arg(
+                    Arg::with_name("rate")
+                        .short("r")
+                        .long("rate")
+                        .value_name("PPS")
+                        .takes_value(true)
+                        .default_value("0")
+                        .validator(is_u64)
+                        .help("Maximum packets per second (0 = unlimited)"),
+                ),
         )
         .subcommand(
             SubCommand::with_name("spy")
@@ -385,6 +443,30 @@ fn process_rpc_url(
     Ok(())
 }
 
+fn process_bombard(matches: &ArgMatches) -> std::io::Result<()> {
+    let endpoint =
+        solana_net_utils::parse_host_port(matches.value_of("endpoint").unwrap()).unwrap_or_else(
+            |e| {
+                eprintln!("Failed to parse endpoint: {e}");
+                exit(1);
+            },
+        );
+    let keypair = keypair_of(matches, "identity");
+    let mut shred_version = value_t_or_exit!(matches, "shred_version", u16);
+    if shred_version == 0 {
+        shred_version = get_entrypoint_shred_version(&[endpoint]).unwrap_or_else(|| {
+            warn!("Could not auto-detect shred version; ContactInfo packets may be filtered");
+            0
+        });
+    }
+    let count = matches
+        .value_of("count")
+        .map(|n| n.parse::<u64>().unwrap());
+    let rate = value_t_or_exit!(matches, "rate", u64);
+
+    solana_gossip::bombard::bombard_endpoint(endpoint, keypair, shred_version, count, rate)
+}
+
 fn get_gossip_address(matches: &ArgMatches, entrypoint_addrs: &[SocketAddr]) -> SocketAddr {
     let bind_address = parse_bind_address(matches, entrypoint_addrs);
     SocketAddr::new(
@@ -405,6 +487,9 @@ fn main() -> Result<(), Box<dyn error::Error>> {
     let matches = parse_matches();
     let socket_addr_space = SocketAddrSpace::new(matches.is_present("allow_private_addr"));
     match matches.subcommand() {
+        ("bombard", Some(matches)) => {
+            process_bombard(matches)?;
+        }
         ("spy", Some(matches)) => {
             process_spy(matches, socket_addr_space)?;
         }

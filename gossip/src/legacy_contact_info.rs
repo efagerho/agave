@@ -2,8 +2,9 @@
 use crate::{socketaddr, socketaddr_any};
 use {
     crate::crds_data::reject_deserialize,
+    rand::Rng,
     serde::Serialize,
-    solana_pubkey::Pubkey,
+    solana_pubkey::{self, Pubkey},
     solana_sanitize::{Sanitize, SanitizeError},
     std::net::SocketAddr,
 };
@@ -76,5 +77,24 @@ impl LegacyContactInfo {
     #[inline]
     pub(crate) fn wallclock(&self) -> u64 {
         self.wallclock
+    }
+
+    pub(crate) fn new_rand<R: Rng>(rng: &mut R, pubkey: Option<Pubkey>) -> Self {
+        let addr = SocketAddr::from(([0, 0, 0, 0], 0));
+        LegacyContactInfo {
+            id: pubkey.unwrap_or_else(solana_pubkey::new_rand),
+            gossip: addr,
+            tvu: addr,
+            tvu_quic: addr,
+            serve_repair_quic: addr,
+            tpu: addr,
+            tpu_forwards: addr,
+            tpu_vote: addr,
+            rpc: addr,
+            rpc_pubsub: addr,
+            serve_repair: addr,
+            wallclock: crate::crds_data::new_rand_timestamp(rng),
+            shred_version: 0,
+        }
     }
 }

@@ -8533,6 +8533,7 @@ dependencies = [
  "log",
  "solana-clap-utils",
  "solana-gossip",
+ "solana-keypair",
  "solana-net-utils",
  "solana-pubkey 4.2.0",
  "solana-version",
