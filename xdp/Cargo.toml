@@ -26,5 +26,9 @@ aya = { workspace = true }
 caps = { workspace = true }
 core_affinity = { workspace = true }
 
+[[example]]
+name = "xdp-sender"
+required-features = ["agave-unstable-api"]
+
 [lints]
 workspace = true
