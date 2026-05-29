@@ -31,6 +31,7 @@ use {
         epoch_slots::EpochSlots,
         epoch_specs::EpochSpecs,
         gossip_error::GossipError,
+        peer_vec_pool::PooledPeerVec,
         ping_pong::Pong,
         protocol::{
             DUPLICATE_SHRED_MAX_PAYLOAD_SIZE, MAX_INCREMENTAL_SNAPSHOT_HASHES,
@@ -1097,23 +1098,31 @@ impl ClusterInfo {
     }
 
     /// all tvu peers with valid gossip addrs that likely have the slot being requested
-    pub fn repair_peers(&self, slot: Slot) -> Vec<ContactInfo> {
+    pub fn repair_peers(&self, slot: Slot) -> PooledPeerVec {
         let _st = ScopedTimer::from(&self.stats.repair_peers);
         let self_pubkey = self.id();
         let gossip_crds = self.gossip.crds.read().unwrap();
-        gossip_crds
-            .get_nodes_contact_info()
-            .filter(|node| {
-                node.pubkey() != &self_pubkey
-                    && self.check_socket_addr_space(&node.tvu(contact_info::Protocol::UDP))
-                    && self.check_socket_addr_space(&node.serve_repair(contact_info::Protocol::UDP))
-                    && match gossip_crds.get::<&LowestSlot>(*node.pubkey()) {
-                        None => true, // fallback to legacy behavior
-                        Some(lowest_slot) => lowest_slot.lowest <= slot,
-                    }
-            })
-            .cloned()
-            .collect()
+        // Reuse the per-thread peer buffer; on a steady-state call this skips
+        // both the realloc chain and the first-touch page faults that an
+        // ephemeral allocation would incur. See `peer_vec_pool`.
+        let mut peers = PooledPeerVec::checkout(gossip_crds.num_nodes());
+        peers.extend(
+            gossip_crds
+                .get_nodes_contact_info()
+                .filter(|node| {
+                    node.pubkey() != &self_pubkey
+                        && self.check_socket_addr_space(&node.tvu(contact_info::Protocol::UDP))
+                        && self.check_socket_addr_space(
+                            &node.serve_repair(contact_info::Protocol::UDP),
+                        )
+                        && match gossip_crds.get::<&LowestSlot>(*node.pubkey()) {
+                            None => true, // fallback to legacy behavior
+                            Some(lowest_slot) => lowest_slot.lowest <= slot,
+                        }
+                })
+                .cloned(),
+        );
+        peers
     }
 
     fn is_spy_node(node: &ContactInfo, socket_addr_space: &SocketAddrSpace) -> bool {

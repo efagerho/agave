@@ -32,6 +32,7 @@ use {
     solana_gossip::{
         cluster_info::{ClusterInfo, ClusterInfoError},
         contact_info::{ContactInfo, Protocol},
+        peer_vec_pool::PooledPeerVec,
         ping_pong::{self, Pong},
         weighted_shuffle::WeightedShuffle,
     },
@@ -1704,7 +1705,7 @@ impl ServeRepair {
         repair_protocol: Protocol,
         my_pubkey: &Pubkey,
     ) -> Result<Vec<(Pubkey, SocketAddr)>> {
-        let repair_peers: Vec<_> = self.repair_peers(repair_validators, slot, my_pubkey);
+        let repair_peers = self.repair_peers(repair_validators, slot, my_pubkey);
         if repair_peers.is_empty() {
             return Err(ClusterInfoError::NoPeers.into());
         }
@@ -1729,7 +1730,7 @@ impl ServeRepair {
         repair_validators: &Option<HashSet<Pubkey>>,
         my_pubkey: &Pubkey,
     ) -> Option<(Pubkey, SocketAddr)> {
-        let repair_peers: Vec<_> = self.repair_peers(repair_validators, slot, my_pubkey);
+        let repair_peers = self.repair_peers(repair_validators, slot, my_pubkey);
         if repair_peers.is_empty() {
             return None;
         }
@@ -1900,18 +1901,17 @@ impl ServeRepair {
         repair_validators: &Option<HashSet<Pubkey>>,
         slot: Slot,
         my_pubkey: &Pubkey,
-    ) -> Vec<ContactInfo> {
+    ) -> PooledPeerVec {
         if let Some(repair_validators) = repair_validators {
-            repair_validators
-                .iter()
-                .filter_map(|key| {
-                    if key != my_pubkey {
-                        self.cluster_info.lookup_contact_info(key, |ci| ci.clone())
-                    } else {
-                        None
-                    }
-                })
-                .collect()
+            let mut peers = PooledPeerVec::checkout(repair_validators.len());
+            peers.extend(repair_validators.iter().filter_map(|key| {
+                if key != my_pubkey {
+                    self.cluster_info.lookup_contact_info(key, |ci| ci.clone())
+                } else {
+                    None
+                }
+            }));
+            peers
         } else {
             self.cluster_info.repair_peers(slot)
         }
