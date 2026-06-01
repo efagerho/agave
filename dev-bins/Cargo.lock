@@ -351,6 +351,7 @@ dependencies = [
  "agave-votor-messages",
  "bincode",
  "bitvec",
+ "bytes",
  "crossbeam-channel",
  "itertools 0.14.0",
  "lazy-lru",
@@ -373,6 +374,7 @@ dependencies = [
  "solana-measure",
  "solana-metrics",
  "solana-pubkey 4.2.0",
+ "solana-quic-datagram",
  "solana-rpc",
  "solana-runtime",
  "solana-signature",
@@ -385,6 +387,7 @@ dependencies = [
  "solana-vote",
  "solana-vote-program",
  "thiserror 2.0.18",
+ "tokio",
  "wincode",
 ]
 
@@ -6933,6 +6936,7 @@ dependencies = [
  "solana-poh",
  "solana-poh-config",
  "solana-pubkey 4.2.0",
+ "solana-quic-datagram",
  "solana-rayon-threadlimit",
  "solana-rpc",
  "solana-rpc-client-api",
@@ -7784,6 +7788,7 @@ dependencies = [
  "solana-pubkey 4.2.0",
  "solana-pubsub-client",
  "solana-quic-client",
+ "solana-quic-datagram",
  "solana-rent",
  "solana-rpc-client",
  "solana-rpc-client-api",
@@ -7808,7 +7813,9 @@ dependencies = [
  "static_assertions",
  "strum",
  "tempfile",
+ "tokio",
  "tokio-util 0.7.18",
+ "wincode",
 ]
 
 [[package]]
@@ -8306,6 +8313,29 @@ dependencies = [
  "solana-streamer",
  "solana-tls-utils",
  "solana-transaction-error",
+ "thiserror 2.0.18",
+ "tokio",
+]
+
+[[package]]
+name = "solana-quic-datagram"
+version = "4.2.0-alpha.0"
+dependencies = [
+ "arc-swap",
+ "arrayvec",
+ "bytes",
+ "crossbeam-channel",
+ "dashmap",
+ "futures 0.3.32",
+ "log",
+ "quinn",
+ "quinn-proto",
+ "rustls",
+ "solana-keypair",
+ "solana-metrics",
+ "solana-net-utils",
+ "solana-pubkey 4.2.0",
+ "solana-tls-utils",
  "thiserror 2.0.18",
  "tokio",
 ]
@@ -9441,6 +9471,7 @@ checksum = "0ced92c60aa76ec4780a9d93f3bd64dfa916e1b998eacc6f1c110f3f444f02c9"
 name = "solana-tls-utils"
 version = "4.2.0-alpha.0"
 dependencies = [
+ "quinn",
  "rustls",
  "solana-keypair",
  "solana-pubkey 4.2.0",

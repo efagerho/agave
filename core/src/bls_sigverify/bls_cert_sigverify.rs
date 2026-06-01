@@ -1,5 +1,5 @@
 use {
-    super::{bls_sigverifier::BAN_TIMEOUT, errors::SigVerifyCertError, stats::SigVerifyCertStats},
+    super::{errors::SigVerifyCertError, stats::SigVerifyCertStats},
     crate::bls_sigverify::{bls_sigverifier::NUM_SLOTS_FOR_VERIFY, utils::send_certs_to_pool},
     agave_bls_cert_verify::cert_verify::Error as BlsCertVerifyError,
     agave_votor_messages::{
@@ -13,9 +13,7 @@ use {
     },
     solana_clock::Slot,
     solana_measure::measure::Measure,
-    solana_pubkey::Pubkey,
     solana_runtime::bank::Bank,
-    solana_streamer::nonblocking::simple_qos::SimpleQosBanlist,
     std::{collections::HashSet, num::NonZeroU64},
     thiserror::Error,
 };
@@ -23,7 +21,6 @@ use {
 #[derive(Clone, Debug)]
 pub(super) struct CertPayload {
     pub(super) cert: Certificate,
-    pub(super) remote_pubkey: Pubkey,
 }
 
 #[derive(Debug, Error)]
@@ -43,7 +40,7 @@ enum CertVerifyError {
 /// Verifies certificates and sends the verified certificates to the consensus pool.
 ///
 /// Additionally inserts valid [`CertificateType`]s into `verified_certs_set`.
-/// Any certificate that fails verification will have its sender banlisted.
+/// Certificates that fail verification are dropped.
 ///
 /// Function expects that the caller has already deduped the certs to verify i.e.
 /// none of the certs appear in the [`verified_certs_set`].
@@ -52,7 +49,6 @@ pub(super) fn verify_and_send_certificates(
     certs: Vec<CertPayload>,
     root_bank: &Bank,
     channel_to_pool: &Sender<Vec<ConsensusMessage>>,
-    banlist: &SimpleQosBanlist,
     thread_pool: &ThreadPool,
 ) -> Result<SigVerifyCertStats, SigVerifyCertError> {
     for cert in certs.iter().map(|cert_payload| &cert_payload.cert) {
@@ -71,7 +67,6 @@ pub(super) fn verify_and_send_certificates(
         root_bank,
         verified_certs_set,
         &mut stats,
-        banlist,
         thread_pool,
     );
     stats.sig_verified_certs += messages.len() as u64;
@@ -87,14 +82,13 @@ pub(super) fn verify_and_send_certificates(
 /// Verifies certificates in `certs`, stores a local copy, and prepares them for forwarding.
 ///
 /// The valid certs are inserted into the [`verified_certs_set`].
-/// Invalid cert senders are banlisted.
+/// Invalid certs are dropped.
 /// Returns a Vec of [`ConsensusMessage`] constructed from the valid certs.
 fn verify_certs(
     certs: Vec<CertPayload>,
     root_bank: &Bank,
     verified_certs_set: &mut HashSet<CertificateType>,
     stats: &mut SigVerifyCertStats,
-    banlist: &SimpleQosBanlist,
     thread_pool: &ThreadPool,
 ) -> Vec<ConsensusMessage> {
     let verified = thread_pool.install(|| {
@@ -118,21 +112,6 @@ fn verify_certs(
                 Some(ConsensusMessage::Certificate(cert))
             }
             Err(e) => {
-                match &e {
-                    CertVerifyError::NotEnoughStake { .. }
-                    | CertVerifyError::CertVerifyFailed(_) => {
-                        if banlist.ban(cert_payload.remote_pubkey, BAN_TIMEOUT) {
-                            stats.already_banned += 1;
-                        } else {
-                            info!(
-                                "bls_cert_sigverify: banned sender={} due to error {e}",
-                                cert_payload.remote_pubkey
-                            );
-                        }
-                    }
-                    CertVerifyError::TooFarInFuture { .. } => {}
-                }
-
                 match e {
                     CertVerifyError::NotEnoughStake { .. } => {
                         stats.stake_verification_failed += 1;
