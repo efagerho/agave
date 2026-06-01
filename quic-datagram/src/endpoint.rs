@@ -16,11 +16,12 @@ use {
         key_updater::{IdentitySnapshot, KeyUpdater},
         server::ServerConnection,
         stats::{self, QuicDatagramStats, add},
+        subnet_rate_limit::SubnetRateLimiter,
         transport::{new_client_config, new_server_config},
     },
     bytes::Bytes,
     crossbeam_channel::Sender,
-    log::{info, warn},
+    log::{debug, info, warn},
     quinn::{Endpoint, EndpointConfig, Incoming, TokioRuntime},
     solana_keypair::{Keypair, Signer},
     solana_pubkey::Pubkey,
@@ -148,6 +149,8 @@ struct EndpointLoop<A: Admission> {
 
 impl<A: Admission> EndpointLoop<A> {
     async fn run(mut self) {
+        let subnet_limit = Arc::new(SubnetRateLimiter::new());
+
         let mut metrics = tokio::time::interval(METRICS_INTERVAL);
         metrics.set_missed_tick_behavior(MissedTickBehavior::Skip);
 
@@ -190,7 +193,7 @@ impl<A: Admission> EndpointLoop<A> {
                 }
                 maybe_incoming = self.endpoint.accept() => {
                     let Some(incoming) = maybe_incoming else { break };
-                    self.accept_connection(incoming);
+                    self.accept_connection(incoming, &subnet_limit);
                 }
                 // when idle we can take care of bookkeeping. If these are delayed
                 // it is usually not a problem.
@@ -285,10 +288,29 @@ impl<A: Admission> EndpointLoop<A> {
 
     /// Performs the non-expensive checks to handle incoming connections.
     /// Then spawns the statemachine to handle the handshake and serve connection.
-    fn accept_connection(&self, incoming: Incoming) {
+    fn accept_connection(&self, incoming: Incoming, subnet_limit: &Arc<SubnetRateLimiter>) {
         let remote_addr = incoming.remote_address();
         if remote_addr.is_ipv6() || remote_addr.ip().is_multicast() {
             incoming.ignore();
+            return;
+        }
+        if !incoming.remote_address_validated() {
+            match incoming.retry() {
+                Ok(()) => add(&self.stats.handshake_retry_sent),
+                Err(e) => {
+                    debug!("retry() failed for {remote_addr}");
+                    e.into_incoming().ignore();
+                }
+            }
+            return;
+        }
+        // Post-RETRY: Gate per-subnet here,
+        // *before* spending CPU on the TLS handshake. An attacker with a
+        // large IP pool can complete RETRY on each address but is bounded
+        // by the per-/24 burst budget (100 attempts, refilling 1/min).
+        if !subnet_limit.admit(remote_addr.ip()) {
+            add(&self.stats.handshake_rejected_subnet_flood);
+            incoming.refuse();
             return;
         }
         ServerConnection {

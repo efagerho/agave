@@ -32,9 +32,14 @@ pub(crate) struct QuicDatagramStats {
     pub(crate) handshake_rejected_not_admitted: AtomicU64,
     pub(crate) handshake_rejected_table_full: AtomicU64,
     pub(crate) handshake_rejected_wrong_direction: AtomicU64,
+    /// Source IP's subnet exceeded its handshake-attempt budget
+    pub(crate) handshake_rejected_subnet_flood: AtomicU64,
+    pub(crate) handshake_retry_sent: AtomicU64,
 
     // Datagram path
     pub(crate) datagram_ingress_dropped_channel_full: AtomicU64,
+    /// Peer's incoming datagram exceeded the per-connection rate.
+    pub(crate) datagram_rate_limited: AtomicU64,
     pub(crate) send_datagram_error_connection_lost: AtomicU64,
     pub(crate) send_datagram_error_too_large: AtomicU64,
     pub(crate) send_datagram_error_unsupported_by_peer: AtomicU64,
@@ -237,8 +242,23 @@ pub(crate) fn report(stats: &QuicDatagramStats) {
             i64
         ),
         (
+            "handshake_rejected_subnet_flood",
+            swap!(stats.handshake_rejected_subnet_flood),
+            i64
+        ),
+        (
+            "handshake_retry_sent",
+            swap!(stats.handshake_retry_sent),
+            i64
+        ),
+        (
             "datagram_ingress_dropped_channel_full",
             swap!(stats.datagram_ingress_dropped_channel_full),
+            i64
+        ),
+        (
+            "datagram_rate_limited",
+            swap!(stats.datagram_rate_limited),
             i64
         ),
         (

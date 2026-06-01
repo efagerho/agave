@@ -12,6 +12,7 @@ pub mod key_updater;
 pub(crate) mod read_loop;
 pub(crate) mod server;
 pub(crate) mod stats;
+pub(crate) mod subnet_rate_limit;
 pub(crate) mod transport;
 
 pub use {
@@ -33,3 +34,13 @@ pub const MAX_PEERS: usize = 2000;
 /// drainers. Production steady-state pressure is far lower (per-validator
 /// vote rate is ~1 message/slot).
 pub const EGRESS_CHANNEL_CAP: usize = 16384;
+
+/// Per-peer receive-side rate limit. Each connection read loop
+/// enforces RX rate via a token bucket; bucket starts full at
+/// connection open and refills continously. Any datagram arriving
+/// when the bucket has no tokens left is dropped.
+pub const MAX_DATAGRAMS_PER_SECOND_PER_PEER: f64 = 30.0;
+
+/// Per-peer receive side burst limit. Complimentary to
+/// [`MAX_DATAGRAMS_PER_SECOND_PER_PEER`], allows for bursty arrivals
+pub const BURST_DATAGRAMS_PER_SECOND_PER_PEER: u64 = 100;

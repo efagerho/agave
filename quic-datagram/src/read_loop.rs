@@ -3,6 +3,7 @@
 
 use {
     crate::{
+        BURST_DATAGRAMS_PER_SECOND_PER_PEER, MAX_DATAGRAMS_PER_SECOND_PER_PEER,
         endpoint::Datagram,
         error::Error,
         stats::{QuicDatagramStats, record_error},
@@ -10,6 +11,7 @@ use {
     crossbeam_channel::{Sender, TrySendError},
     log::debug,
     quinn::Connection,
+    solana_net_utils::token_bucket::TokenBucket,
     solana_pubkey::Pubkey,
     std::{
         net::SocketAddr,
@@ -27,24 +29,39 @@ pub(crate) async fn read_datagram_loop(
     ingress: Sender<Datagram>,
     stats: Arc<QuicDatagramStats>,
 ) {
+    // Per-connection rate limiter. Any datagram arriving with the bucket
+    // empty is dropped. We do NOT close the connection here, honest peers
+    // legitimately burst above the refill rate during catch-up.
+    let rate_limit = TokenBucket::new(
+        BURST_DATAGRAMS_PER_SECOND_PER_PEER,
+        BURST_DATAGRAMS_PER_SECOND_PER_PEER,
+        MAX_DATAGRAMS_PER_SECOND_PER_PEER,
+    );
     loop {
         match connection.read_datagram().await {
-            Ok(bytes) => match ingress.try_send(Datagram {
-                peer_pubkey: peer,
-                peer_address: remote_addr,
-                message: bytes,
-            }) {
-                Ok(()) => {}
-                Err(TrySendError::Full(_)) => {
-                    stats
-                        .datagram_ingress_dropped_channel_full
-                        .fetch_add(1, Ordering::Relaxed);
+            Ok(bytes) => {
+                if rate_limit.consume_tokens(1).is_err() {
+                    drop(bytes);
+                    stats.datagram_rate_limited.fetch_add(1, Ordering::Relaxed);
+                    continue;
                 }
-                Err(TrySendError::Disconnected(_)) => {
-                    debug!("ingress disconnected; reader for {peer} exiting");
-                    break;
+                match ingress.try_send(Datagram {
+                    peer_pubkey: peer,
+                    peer_address: remote_addr,
+                    message: bytes,
+                }) {
+                    Ok(()) => {}
+                    Err(TrySendError::Full(_)) => {
+                        stats
+                            .datagram_ingress_dropped_channel_full
+                            .fetch_add(1, Ordering::Relaxed);
+                    }
+                    Err(TrySendError::Disconnected(_)) => {
+                        debug!("ingress disconnected; reader for {peer} exiting");
+                        break;
+                    }
                 }
-            },
+            }
             Err(e) => {
                 record_error(&Error::from(e), &stats);
                 break;
