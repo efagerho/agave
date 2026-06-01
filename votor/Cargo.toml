@@ -81,6 +81,8 @@ wincode = { workspace = true, features = ["alloc"] }
 
 [dev-dependencies]
 agave-votor = { path = ".", features = ["agave-unstable-api", "dev-context-only-utils"] }
+clap = { version = "4.5.58", features = ["derive"] }
+num_cpus = { workspace = true }
 rand = { workspace = true }
 solana-net-utils = { path = "../net-utils", features = ["agave-unstable-api"] }
 solana-perf = { path = "../perf", features = ["agave-unstable-api", "dev-context-only-utils"] }
