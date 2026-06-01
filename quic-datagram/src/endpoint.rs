@@ -1,0 +1,304 @@
+//! QUIC datagram endpoint: public handle ([`QuicDatagramEndpoint`]) plus
+//! its unified control loop ([`EndpointLoop`]). One tokio task handles
+//! server accept, client egress, identity rotation, and metrics. Each
+//! event source is an arm of a single `tokio::select!`; heavy per-event
+//! work is spawned onto its own task so a slow handshake or dial does not
+//! block dispatch of the next event.
+
+use {
+    crate::{
+        EGRESS_CHANNEL_CAP,
+        admission::Admission,
+        client::ClientConnection,
+        close_codes,
+        connection_table::{ConnectionTable, EgressDispatch},
+        error::Error,
+        key_updater::{IdentitySnapshot, KeyUpdater},
+        server::ServerConnection,
+        stats::{self, QuicDatagramStats, add},
+        transport::{new_client_config, new_server_config},
+    },
+    bytes::Bytes,
+    crossbeam_channel::Sender,
+    log::{info, warn},
+    quinn::{Endpoint, EndpointConfig, Incoming, TokioRuntime},
+    solana_keypair::{Keypair, Signer},
+    solana_pubkey::Pubkey,
+    solana_tls_utils::new_dummy_x509_certificate,
+    std::{
+        net::{SocketAddr, UdpSocket},
+        sync::{Arc, atomic::Ordering},
+        time::Duration,
+    },
+    tokio::{
+        sync::{mpsc, watch},
+        task::JoinHandle,
+        time::MissedTickBehavior,
+    },
+};
+
+const METRICS_INTERVAL: Duration = Duration::from_secs(2);
+
+/// Datagram envelope used on both directions of the endpoint.
+#[derive(Debug)]
+pub struct Datagram {
+    pub peer_pubkey: Pubkey,
+    pub peer_address: SocketAddr,
+    pub message: Bytes,
+}
+
+/// Datagram-only QUIC endpoint bound to UDP socket. The single control
+/// loop task is spawned by [`Self::new`]; await `task` after
+/// [`Self::close`] to observe full drain.
+pub struct QuicDatagramEndpoint {
+    pub endpoint: Endpoint,
+    pub egress: mpsc::Sender<Datagram>,
+    /// Handle for rotating the local identity (TLS cert / pubkey). Wraps a
+    /// `tokio::sync::watch` channel; the actual swap happens asynchronously
+    /// in the control loop. Implements `solana_tls_utils::NotifyKeyUpdate`
+    /// so it slots into the validator's `KeyUpdaters` registry.
+    pub key_updater: Arc<KeyUpdater>,
+    pub task: JoinHandle<()>,
+}
+
+impl QuicDatagramEndpoint {
+    /// Construct a datagram-only QUIC endpoint bound to `socket`. Spawns the
+    /// unified control loop on `runtime`. Received datagrams flow into
+    /// `ingress` via `try_send`; full ingress channel results in a drop
+    /// (counted in `datagram_ingress_dropped_channel_full`).
+    ///
+    /// `admission` is consulted once per new connection in either direction.
+    pub fn new<A: Admission>(
+        runtime: &tokio::runtime::Handle,
+        keypair: &Keypair,
+        socket: UdpSocket,
+        alpn_protocol_id: &'static [u8],
+        ingress: Sender<Datagram>,
+        admission: Arc<A>,
+    ) -> Result<Self, Error> {
+        let local_pubkey = keypair.pubkey();
+        let (cert, key) = new_dummy_x509_certificate(keypair);
+        let server_config = new_server_config(cert.clone(), key.clone_key(), alpn_protocol_id);
+        let client_config = new_client_config(cert, key, alpn_protocol_id);
+
+        let mut endpoint = {
+            // Endpoint::new requires being inside the runtime context, else it
+            // panics on its first internal `tokio::spawn`.
+            let _guard = runtime.enter();
+            Endpoint::new(
+                EndpointConfig::default(),
+                Some(server_config),
+                socket,
+                Arc::new(TokioRuntime),
+            )
+            .map_err(Error::Endpoint)?
+        };
+        endpoint.set_default_client_config(client_config);
+
+        let table = Arc::new(ConnectionTable::new());
+        let stats = Arc::<QuicDatagramStats>::default();
+        let (egress_tx, egress_rx) = mpsc::channel(EGRESS_CHANNEL_CAP);
+        let (key_updater, identity_rx) = KeyUpdater::new();
+        let key_updater = Arc::new(key_updater);
+
+        let control = EndpointLoop {
+            endpoint: endpoint.clone(),
+            local_pubkey,
+            egress_rx,
+            ingress,
+            admission,
+            identity_rx,
+            connections: table,
+            stats,
+            alpn: alpn_protocol_id,
+        };
+        let task = runtime.spawn(control.run());
+
+        Ok(Self {
+            endpoint,
+            egress: egress_tx,
+            key_updater,
+            task,
+        })
+    }
+
+    /// Initiate endpoint shutdown. The control loop exits on its next
+    /// `endpoint.accept()` resolution (returns `None` once closed); in-flight
+    /// connections are closed with `SHUTDOWN`. Callers should `await`
+    /// [`Self::task`] to ensure all connections are terminated gracefully.
+    pub fn close(&self) {
+        self.endpoint
+            .close(close_codes::SHUTDOWN.code, close_codes::SHUTDOWN.reason);
+    }
+}
+
+struct EndpointLoop<A: Admission> {
+    endpoint: Endpoint,
+    local_pubkey: Pubkey,
+    egress_rx: mpsc::Receiver<Datagram>,
+    ingress: Sender<Datagram>,
+    admission: Arc<A>,
+    identity_rx: watch::Receiver<Option<Arc<IdentitySnapshot>>>,
+    connections: Arc<ConnectionTable>,
+    stats: Arc<QuicDatagramStats>,
+    /// Held so that an identity rotation can rebuild server + client TLS
+    /// configs without revisiting the caller.
+    alpn: &'static [u8],
+}
+
+impl<A: Admission> EndpointLoop<A> {
+    async fn run(mut self) {
+        let mut metrics = tokio::time::interval(METRICS_INTERVAL);
+        metrics.set_missed_tick_behavior(MissedTickBehavior::Skip);
+
+        // The loop exits when egress / accept channels close - running a
+        // half-broken endpoint after one of those has gone away is
+        // pointless. The `identity_rx` arm is the lone exception: when
+        // the `KeyUpdater`-side `watch::Sender` is dropped we disable the
+        // arm via `id_closed` and keep running without identity rotation.
+        //
+        // TODO: this tolerance exists only to paper over `local-cluster`
+        // passing a throwaway `Arc::new(RwLock::new(None))` for the
+        // `admin_rpc_service_post_init` parameter to `Validator::new`.
+        // That Arc drops the moment `Validator::new` returns, taking the
+        // whole `Arc<KeyUpdaters> → Arc<KeyUpdater> → watch::Sender`
+        // chain with it. Fix on the caller side is very invasive, so
+        // was not applied.
+        let mut id_closed = false;
+        loop {
+            tokio::select! {
+                biased;
+                // If identity is changed we should reconnect immediately
+                // to maintain coherent state. Any existing backlog of packets
+                // is probably invalid/irrelevant.
+                changed = self.identity_rx.changed(), if !id_closed => {
+                    if changed.is_err() {
+                        // See TODO at top of loop
+                        warn!("identity rotation channel closed; endpoint will run without rotation support");
+                        id_closed = true;
+                        continue;
+                    }
+                    let snap = self.identity_rx.borrow_and_update().clone();
+                    if let Some(snap) = snap {
+                        self.apply_identity_change(snap);
+                    }
+                }
+                // egress to existing peers more important than accepting new
+                maybe_datagram = self.egress_rx.recv() => {
+                    let Some(datagram) = maybe_datagram else { break };
+                    self.handle_datagram(datagram);
+                }
+                maybe_incoming = self.endpoint.accept() => {
+                    let Some(incoming) = maybe_incoming else { break };
+                    self.accept_connection(incoming);
+                }
+                // when idle we can take care of bookkeeping. If these are delayed
+                // it is usually not a problem.
+                _ = metrics.tick() => stats::report(&self.stats),
+            }
+        }
+    }
+
+    /// Rebuild TLS configs against the new identity, swap them into the
+    /// quinn endpoint, evict every cached connection so peers re-handshake,
+    /// and adopt the new pubkey for the lex-direction rule going forward.
+    fn apply_identity_change(&mut self, snap: Arc<IdentitySnapshot>) {
+        let server_config = new_server_config(snap.cert.clone(), snap.key.clone_key(), self.alpn);
+        let client_config = new_client_config(snap.cert.clone(), snap.key.clone_key(), self.alpn);
+
+        self.local_pubkey = snap.pubkey;
+        self.endpoint.set_default_client_config(client_config);
+        self.endpoint.set_server_config(Some(server_config));
+
+        let evicted = self.connections.clear_for_id_change();
+        self.stats
+            .connection_evicted_identity_rotated
+            .fetch_add(evicted, Ordering::Relaxed);
+        info!(
+            "identity rotated to {} ({} connection(s) evicted)",
+            snap.pubkey, evicted
+        );
+    }
+
+    fn handle_datagram(&self, dg: Datagram) {
+        let Datagram {
+            peer_pubkey: peer,
+            peer_address: addr,
+            message: bytes,
+        } = dg;
+        debug_assert_ne!(self.local_pubkey, peer, "egress to self is a caller bug");
+        // Lex rule partition connection directions: lex-higher side
+        // only ever holds inbound (server-accepted) entries; lex-lower side
+        // only ever holds outbound (we-dialed) ones.
+        //
+        //  - Higher side: trust whatever inbound conn we have. The peer's
+        //    source addr can legitimately differ from the
+        //    gossip-published addr due to gossip lag, so we ignore the
+        //    addr argument on hit.
+        //
+        //  - Lower side: cached `Established`'s remote addr is exactly the
+        //    addr we dialed. If the caller now wants a different addr (e.g.
+        //    gossip refreshed the peer's published addr), the peer has
+        //    moved - evict and re-dial. `Dialing` placeholder means another
+        //    egress already kicked off a dial for this peer; drop this
+        //    datagram rather than queueing.
+        if self.local_pubkey >= peer {
+            if self
+                .connections
+                .send_over_inbound(&peer, &bytes, &self.stats)
+            {
+                return;
+            }
+            add(&self.stats.egress_dropped_higher_pubkey);
+            return;
+        }
+
+        // Ask connection table if we should spawn a dialing task
+        // retain the generation ID from it.
+        let generation = match self
+            .connections
+            .dispatch_outbound(peer, addr, &bytes, &self.stats)
+        {
+            EgressDispatch::Sent | EgressDispatch::Dialing => return,
+            EgressDispatch::SpawnDialTask { generation } => generation,
+        };
+
+        // Carry the trigger packet into the dial task; it'll be sent on
+        // the new connection the moment `insert_connection` succeeds.
+        // This is what lets a standstill broadcast (one cert every
+        // `DELTA_STANDSTILL`) actually reach a peer whose connection
+        // had died. Followers arriving during `Dialing` still drop on
+        // the floor (see `dispatch_outbound`'s `Dialing` arm).
+        ClientConnection {
+            endpoint: self.endpoint.clone(),
+            peer,
+            addr,
+            id_generation: generation,
+            trigger: bytes,
+            ingress: self.ingress.clone(),
+            admission: self.admission.clone(),
+            table: self.connections.clone(),
+            stats: self.stats.clone(),
+        }
+        .spawn();
+    }
+
+    /// Performs the non-expensive checks to handle incoming connections.
+    /// Then spawns the statemachine to handle the handshake and serve connection.
+    fn accept_connection(&self, incoming: Incoming) {
+        let remote_addr = incoming.remote_address();
+        if remote_addr.is_ipv6() || remote_addr.ip().is_multicast() {
+            incoming.ignore();
+            return;
+        }
+        ServerConnection {
+            incoming,
+            local_pubkey: self.local_pubkey,
+            ingress: self.ingress.clone(),
+            admission: self.admission.clone(),
+            table: self.connections.clone(),
+            stats: self.stats.clone(),
+        }
+        .spawn();
+    }
+}
