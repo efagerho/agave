@@ -1225,47 +1225,62 @@ impl Validator {
         } else {
             None
         };
-        let (votor_egress, votor_ingress, votor_banlist, votor_admission, _alpenglow_endpoint_task) =
-            if let Some(socket) = alpenglow_socket {
-                let votor_rt_handle = tpu_client_next_runtime
-                    .as_ref()
-                    .map(TokioRuntime::handle)
-                    .unwrap_or_else(|| current_runtime_handle.as_ref().unwrap());
-                let (ingress_tx, ingress_rx) =
-                    crossbeam_channel::bounded(crate::tvu::MAX_ALPENGLOW_PACKET_NUM);
-                let banlist = Arc::new(solana_quic_datagram::Banlist::<Pubkey>::default());
-                // Seed admission synchronously with the current epoch's
-                // staked-set so the endpoint never accepts handshakes
-                // against an empty allow-list. The StakedValidatorsCache
-                // owned by the voting service re-publishes on every epoch
-                // boundary going forward.
-                let admission = agave_votor::datagram_endpoint::build_admission(&bank_forks);
-                let solana_quic_datagram::QuicDatagramEndpoint {
-                    endpoint: _quic_endpoint,
-                    egress,
-                    key_updater,
-                    task,
-                } = agave_votor::datagram_endpoint::spawn(
-                    votor_rt_handle,
-                    &identity_keypair,
-                    socket,
-                    ingress_tx,
-                    admission.clone(),
-                    banlist.clone(),
-                )
-                .map_err(|e| ValidatorError::Other(format!("alpenglow endpoint: {e:?}")))?;
-                key_notifiers
-                    .write()
-                    .unwrap()
-                    .add(KeyUpdaterType::VotorDatagram, key_updater);
-                (egress, ingress_rx, banlist, Some(admission), Some(task))
-            } else {
-                let (egress, _) = tokio::sync::mpsc::channel(1);
-                let (_, ingress) =
-                    crossbeam_channel::bounded::<solana_quic_datagram::endpoint::Datagram>(1);
-                let banlist = Arc::new(solana_quic_datagram::Banlist::<Pubkey>::default());
-                (egress, ingress, banlist, None, None)
-            };
+        let (
+            votor_egress,
+            votor_ingress,
+            votor_banlist,
+            votor_handover_events,
+            votor_admission,
+            _alpenglow_endpoint_task,
+        ) = if let Some(socket) = alpenglow_socket {
+            let votor_rt_handle = tpu_client_next_runtime
+                .as_ref()
+                .map(TokioRuntime::handle)
+                .unwrap_or_else(|| current_runtime_handle.as_ref().unwrap());
+            let (ingress_tx, ingress_rx) =
+                crossbeam_channel::bounded(crate::tvu::MAX_ALPENGLOW_PACKET_NUM);
+            let banlist = Arc::new(solana_quic_datagram::Banlist::<Pubkey>::default());
+            // Seed admission synchronously with the current epoch's
+            // staked-set so the endpoint never accepts handshakes
+            // against an empty allow-list. The StakedValidatorsCache
+            // owned by the voting service re-publishes on every epoch
+            // boundary going forward.
+            let admission = agave_votor::datagram_endpoint::build_admission(&bank_forks);
+            let solana_quic_datagram::QuicDatagramEndpoint {
+                endpoint: _quic_endpoint,
+                egress,
+                handover_events,
+                key_updater,
+                task,
+            } = agave_votor::datagram_endpoint::spawn(
+                votor_rt_handle,
+                &identity_keypair,
+                socket,
+                ingress_tx,
+                admission.clone(),
+                banlist.clone(),
+            )
+            .map_err(|e| ValidatorError::Other(format!("alpenglow endpoint: {e:?}")))?;
+            key_notifiers
+                .write()
+                .unwrap()
+                .add(KeyUpdaterType::VotorDatagram, key_updater);
+            (
+                egress,
+                ingress_rx,
+                banlist,
+                handover_events,
+                Some(admission),
+                Some(task),
+            )
+        } else {
+            let (egress, _) = tokio::sync::mpsc::channel(1);
+            let (_, ingress) =
+                crossbeam_channel::bounded::<solana_quic_datagram::endpoint::Datagram>(1);
+            let banlist = Arc::new(solana_quic_datagram::Banlist::<Pubkey>::default());
+            let (_, handover_events) = tokio::sync::mpsc::channel(1);
+            (egress, ingress, banlist, handover_events, None, None)
+        };
 
         let rpc_override_health_check =
             Arc::new(AtomicBool::new(config.rpc_config.disable_health_check));
@@ -1703,6 +1718,7 @@ impl Validator {
                 votor_egress,
                 votor_ingress,
                 votor_banlist,
+                votor_handover_events,
                 votor_admission,
                 voting_service_test_override: config.voting_service_test_override.clone(),
                 highest_finalized,

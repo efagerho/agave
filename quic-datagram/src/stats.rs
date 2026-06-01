@@ -72,9 +72,15 @@ pub(crate) struct QuicDatagramStats {
     /// caller supplied a new socket addr for the same pubkey (e.g. gossip
     /// observed the peer moved). A re-dial to the new addr follows.
     pub(crate) connection_evicted_peer_moved: AtomicU64,
-    /// We closed a peer's existing connection with `REPLACED` because a new
-    /// handshake from the same pubkey arrived (e.g. hot-spare re-dial).
-    pub(crate) connection_replaced: AtomicU64,
+    /// We closed a peer's existing connection with HANDOVER because a new
+    /// handshake from the same pubkey arrived.
+    pub(crate) connection_replaced_handover: AtomicU64,
+    /// A peer closed our connection with HANDOVER - we have been replaced
+    /// (typically by a backup-node instance of our own identity).
+    pub(crate) handover_received: AtomicU64,
+    /// Caller-supplied handover-events channel was full when we tried to
+    /// notify. The soft-ban still took effect.
+    pub(crate) handover_events_channel_full: AtomicU64,
 }
 
 #[inline]
@@ -303,7 +309,17 @@ pub(crate) fn report(stats: &QuicDatagramStats) {
             swap!(stats.connection_evicted_peer_moved),
             i64
         ),
-        ("connection_replaced", swap!(stats.connection_replaced), i64),
+        (
+            "connection_replaced_handover",
+            swap!(stats.connection_replaced_handover),
+            i64
+        ),
+        ("handover_received", swap!(stats.handover_received), i64),
+        (
+            "handover_events_channel_full",
+            swap!(stats.handover_events_channel_full),
+            i64
+        ),
         (
             "egress_dropped_higher_pubkey",
             swap!(stats.egress_dropped_higher_pubkey),

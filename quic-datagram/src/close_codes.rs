@@ -44,8 +44,9 @@ pub(crate) const NOT_ADMITTED: Spec = Spec {
     reason: b"NOT_ADMITTED",
 };
 
-/// Peer is in the local [`crate::Banlist`] — e.g. an external trigger
-/// such as a BLS signature-verification failure.
+/// Peer is in the local [`crate::Banlist<Pubkey>`] — either via an external
+/// trigger (e.g. BLS sigverify failure) or via the only internal trigger,
+/// HANDOVER reception in the per-connection read loop.
 pub(crate) const BANNED: Spec = Spec {
     code: VarInt::from_u32(4),
     reason: b"BANNED",
@@ -67,13 +68,12 @@ pub(crate) const WRONG_DIRECTION: Spec = Spec {
 };
 
 /// A new handshake from a pubkey already in our table replaced the prior
-/// connection (e.g. a hot-spare instance of the peer's identity came
-/// online and re-dialed). The displaced connection is closed with this
-/// code; the receiving side simply reaps it and re-handshakes if it still
-/// has traffic to send.
-pub(crate) const REPLACED: Spec = Spec {
+/// connection. The receiving side observes this close in its read loop,
+/// soft-bans the evicting peer, and forwards a handover-event uplevel so
+/// consensus can decide whether to shut the node down.
+pub(crate) const HANDOVER: Spec = Spec {
     code: VarInt::from_u32(10),
-    reason: b"REPLACED",
+    reason: b"HANDOVER",
 };
 
 /// Local endpoint's identity (TLS cert / pubkey) was rotated. All existing

@@ -18,6 +18,7 @@ use {
     solana_pubkey::Pubkey,
     solana_tls_utils::{get_remote_pubkey, socket_addr_to_quic_server_name},
     std::{net::SocketAddr, sync::Arc},
+    tokio::sync::mpsc,
 };
 
 /// A client-side connection's full lifecycle: dial, validate identity,
@@ -36,6 +37,7 @@ pub(crate) struct ClientConnection<A: Admission> {
     pub(crate) ingress: Sender<Datagram>,
     pub(crate) admission: Arc<A>,
     pub(crate) banlist: Arc<Banlist<Pubkey>>,
+    pub(crate) handover_events: mpsc::Sender<Pubkey>,
     pub(crate) table: Arc<ConnectionTable>,
     pub(crate) stats: Arc<QuicDatagramStats>,
 }
@@ -110,11 +112,12 @@ impl<A: Admission> ClientConnection<A> {
                 self.addr,
                 self.ingress,
                 self.banlist,
+                self.handover_events,
                 self.stats,
             )
             .await;
             // Reap our slot only if it still points at *this* connection
-            // (a replacement could have taken its place).
+            // (HANDOVER could have replaced it).
             self.table.maybe_reap_connection(&self.peer, stable_id);
             Ok(())
         }

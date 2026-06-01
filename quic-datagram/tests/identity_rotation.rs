@@ -82,4 +82,11 @@ fn rotation_evicts_connections_and_resends_under_new_identity() {
         |d| (d.peer_pubkey == k2_pk && d.message == p2).then_some(()),
         "server never received message attributed to K2 after rotation",
     );
+
+    // Client side: the rotated client should NOT have soft-banned the
+    // server (rotation is a local event, not a HANDOVER-style takeover).
+    assert!(
+        !client.banlist.is_banned(&server.pubkey()),
+        "rotation must not soft-ban peers we close ourselves"
+    );
 }

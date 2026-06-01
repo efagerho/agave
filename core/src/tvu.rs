@@ -183,12 +183,13 @@ pub struct AlpenglowInitializationState {
     // Votor QUIC datagram transport handles. Egress goes to the BLS
     // voting service; ingress feeds the BLS sigverifier; banlist is shared
     // with the sigverifier so external triggers (e.g. signature failure)
-    // can soft-ban peers. `votor_admission` is owned by the voting
-    // service's StakedValidatorsCache, which republishes the staked-pubkey
-    // set on every epoch boundary.
+    // can soft-ban peers cluster-wide. `votor_admission` is owned by the
+    // voting service's StakedValidatorsCache, which republishes the
+    // staked-pubkey set on every epoch boundary.
     pub votor_egress: tokio::sync::mpsc::Sender<solana_quic_datagram::endpoint::Datagram>,
     pub votor_ingress: Receiver<Datagram>,
     pub votor_banlist: Arc<Banlist<Pubkey>>,
+    pub votor_handover_events: tokio::sync::mpsc::Receiver<Pubkey>,
     pub votor_admission: Option<Arc<solana_quic_datagram::StakedNodesAdmission>>,
     pub voting_service_test_override: Option<VotingServiceOverride>,
 
@@ -277,6 +278,7 @@ impl Tvu {
             votor_egress,
             votor_ingress,
             votor_banlist,
+            votor_handover_events,
             votor_admission,
             voting_service_test_override,
             highest_finalized,
@@ -294,7 +296,7 @@ impl Tvu {
 
         // BLS sigverifier — fed by the quic-datagram endpoint constructed
         // in validator.rs. The endpoint task itself runs there; here we
-        // only consume its ingress.
+        // only consume its ingress + banlist.
         //
         // The bls_socket is currently only available on Testnet and
         // Development clusters; outside that window the endpoint is not
@@ -327,6 +329,16 @@ impl Tvu {
             );
             Some(bls_sigverifier_t)
         };
+
+        // Stake-weighted handover shutdown: drain handover events, sum
+        // the evicting peers' epoch stake, set `exit` once the ratio
+        // crosses the threshold (the cluster has accepted a different
+        // instance of our identity).
+        let _handover_shutdown = agave_votor::handover_shutdown::spawn(
+            votor_handover_events,
+            bank_forks.clone(),
+            exit.clone(),
+        );
 
         let (fetch_sender, fetch_receiver) = EvictingSender::new_bounded(SHRED_FETCH_CHANNEL_SIZE);
 
@@ -790,6 +802,7 @@ pub mod tests {
         let (votor_egress, _votor_egress_rx) = tokio::sync::mpsc::channel(1024);
         let (_votor_ingress_tx, votor_ingress) = bounded(1024);
         let votor_banlist = Arc::new(Banlist::<Pubkey>::default());
+        let (_votor_handover_tx, votor_handover_events) = tokio::sync::mpsc::channel(8);
         let replay_highest_frozen = Arc::new(ReplayHighestFrozen::default());
         let (leader_window_info_sender, _leader_window_info_receiver) = unbounded();
         let (optimistic_parent_sender, optimistic_parent_receiver) = unbounded();
@@ -886,6 +899,7 @@ pub mod tests {
                 votor_egress,
                 votor_ingress,
                 votor_banlist,
+                votor_handover_events,
                 votor_admission: None,
                 voting_service_test_override: None,
                 highest_finalized: Arc::new(RwLock::new(None)),

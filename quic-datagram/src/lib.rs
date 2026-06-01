@@ -49,6 +49,11 @@ pub const MAX_PEERS: usize = 2000;
 /// vote rate is ~1 message/slot).
 pub const EGRESS_CHANNEL_CAP: usize = 16384;
 
+/// Capacity of the handover-events channel held by [`QuicDatagramEndpoint`].
+/// Sized to [`MAX_PEERS`] so even the catastrophic "every peer hands us
+/// over" scenario does not overflow.
+pub const HANDOVER_EVENTS_CHANNEL_CAP: usize = MAX_PEERS;
+
 /// Per-peer receive-side rate limit. Each connection read loop
 /// enforces RX rate via a token bucket; bucket starts full at
 /// connection open and refills continously. Any datagram arriving

@@ -31,8 +31,8 @@ use {
 pub const ALPENGLOW_ALPN: &[u8] = b"alpenglow-v1";
 
 /// Construct a [`QuicDatagramEndpoint`] tuned for alpenglow consensus
-/// traffic. Caller owns admission, banlist and ingress; the returned
-/// endpoint owns its control loop task.
+/// traffic. Caller owns admission, banlist, ingress and the banlist
+/// eviction receiver; the returned endpoint owns its control loop task.
 ///
 /// **Identity rotation** — register `endpoint.key_updater.clone()` with
 /// the validator's `KeyUpdaters` registry (implements
@@ -40,7 +40,17 @@ pub const ALPENGLOW_ALPN: &[u8] = b"alpenglow-v1";
 /// pattern is hot-spare failover: a non-voting backup node running
 /// with a throwaway keypair is handed the primary's staked keypair to
 /// promote it. The new identity is already in every peer's admission
-/// set (it's been staked all along) so handshakes pass immediately.
+/// set (it's been staked all along) so handshakes pass immediately;
+/// the primary observes its connections being replaced by HANDOVER on
+/// each peer and exits via the [`crate::handover_shutdown`] threshold.
+///
+/// **Handover monitoring** — drain `endpoint.handover_events` (each
+/// item = a peer pubkey that has accepted a different connection from
+/// our identity). [`crate::handover_shutdown::spawn`] aggregates these,
+/// stake-weights them against the working bank's epoch, and sets the
+/// validator's exit flag once `HANDOVER_SHUTDOWN_STAKE_NUMERATOR/
+/// DENOMINATOR` of the cluster has handed us over.
+#[allow(clippy::too_many_arguments)]
 pub fn spawn<A: Admission>(
     runtime: &tokio::runtime::Handle,
     keypair: &Keypair,

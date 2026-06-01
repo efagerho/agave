@@ -17,6 +17,7 @@ use {
     solana_pubkey::Pubkey,
     solana_tls_utils::get_remote_pubkey,
     std::sync::Arc,
+    tokio::sync::mpsc,
 };
 
 /// A server-side connection representation
@@ -26,6 +27,7 @@ pub(crate) struct ServerConnection<A: Admission> {
     pub(crate) ingress: Sender<Datagram>,
     pub(crate) admission: Arc<A>,
     pub(crate) banlist: Arc<Banlist<Pubkey>>,
+    pub(crate) handover_events: mpsc::Sender<Pubkey>,
     pub(crate) table: Arc<ConnectionTable>,
     pub(crate) stats: Arc<QuicDatagramStats>,
 }
@@ -45,8 +47,8 @@ impl<A: Admission> ServerConnection<A> {
         });
     }
 
-    /// accept, validate identity / admission, install in the table, run the
-    /// read loop, reap on exit.
+    /// post-RETRY accept, validate identity / banlist / admission,
+    /// install in the table, run the read loop, reap on exit.
     async fn run(self) -> Result<(), Error> {
         // Snapshot the identity generation BEFORE the handshake starts.
         // If our identity rotates while quinn is driving the handshake,
@@ -109,11 +111,12 @@ impl<A: Admission> ServerConnection<A> {
             remote_addr,
             self.ingress,
             self.banlist,
+            self.handover_events,
             self.stats,
         )
         .await;
         // Reap our slot only if it still points at *this* connection
-        // (a newer one may have taken our place).
+        // (a newer one may have taken our place via HANDOVER).
         self.table.maybe_reap_connection(&peer, stable_id);
         Ok(())
     }

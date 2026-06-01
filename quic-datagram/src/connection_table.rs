@@ -21,13 +21,14 @@ use {
 /// while a single in-flight dial task brings the connection up) or
 /// `Established` (a live [`quinn::Connection`] for one peer). A new
 /// handshake from a pubkey already in `Established` closes the old
-/// connection with `REPLACED` and installs the new one - we assume that
+/// connection with `HANDOVER` and installs the new one - we assume that
 /// the remote validator is a hot-spare that was just brought up.
-/// The displaced side observes `REPLACED` in its read loop and reaps the
-/// connection.
+/// The displaced side observes `HANDOVER` in its
+/// read loop, soft-bans the peer, and reports the event to the driving
+/// service (e.g. votor).
 ///
 /// Backed by [`DashMap`] - multiple tasks (server-accept, client-egress,
-/// per-connection read loops) hammer the table concurrently.
+/// per-connection read loops, banlist evictor) hammer the table concurrently.
 ///
 /// INVARIANT: no code path can hold a `Ref`/`RefMut` from the DashMap across
 /// an `.await` - DashMap entry locks held across yield points will deadlock
@@ -59,7 +60,7 @@ pub(crate) enum InsertOutcome {
     /// the new connection takes the slot.
     Inserted,
     /// Table already held an `Established` connection for this peer. The
-    /// old one was closed with `REPLACED`; the new one took its place.
+    /// old one was closed with `HANDOVER`; the new one took its place.
     Replaced,
     /// Table was at [`MAX_PEERS`] and this is a fresh pubkey. Caller must
     /// close the connection with `TABLE_FULL`.
@@ -119,7 +120,7 @@ impl ConnectionTable {
     /// they snapshotted at handshake start. Returns:
     /// - `Inserted` on a fresh slot (or one previously holding our own
     ///   `Dialing` placeholder at the same generation).
-    /// - `Replaced` if a prior `Established` was displaced (REPLACED); the
+    /// - `Replaced` if a prior `Established` was displaced (HANDOVER); the
     ///   old connection is closed inside this method.
     /// - `Rejected` if the table is at [`MAX_PEERS`] and this is a fresh
     ///   pubkey; caller must close `conn` with `TABLE_FULL`. This should
@@ -157,14 +158,16 @@ impl ConnectionTable {
                 let old =
                     std::mem::replace(slot.get_mut(), ConnectionTableEntry::Established(conn));
                 match old {
-                    // Our own placeholder; just transition state - not a replacement.
+                    // Our own placeholder; just transition state - not a handover.
                     ConnectionTableEntry::Dialing(_) => InsertOutcome::Inserted,
-                    // A prior live connection for this pubkey. Normal when a
-                    // hot-spare instance of the peer re-dials.
+                    // A prior live connection for this pubkey. Normal during
+                    // handover.
                     ConnectionTableEntry::Established(old_conn) => {
                         // close the displaced connection with appropriate code.
-                        close_codes::REPLACED.close(&old_conn);
-                        stats.connection_replaced.fetch_add(1, Ordering::Relaxed);
+                        close_codes::HANDOVER.close(&old_conn);
+                        stats
+                            .connection_replaced_handover
+                            .fetch_add(1, Ordering::Relaxed);
                         InsertOutcome::Replaced
                     }
                 }
@@ -292,7 +295,7 @@ impl ConnectionTable {
 
     /// Remove the slot for `peer` if and only if it currently holds an
     /// `Established` with the given `stable_id`. No-op if the slot holds
-    /// a different connection (a replacement landed) or a
+    /// a different connection (HANDOVER replacement landed) or a
     /// `Dialing` placeholder.
     pub(crate) fn maybe_reap_connection(&self, peer: &Pubkey, stable_id: usize) {
         if let Entry::Occupied(entry) = self.inner.entry(*peer)

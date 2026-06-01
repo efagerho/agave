@@ -1,13 +1,13 @@
 //! QUIC datagram endpoint: public handle ([`QuicDatagramEndpoint`]) plus
 //! its unified control loop ([`EndpointLoop`]). One tokio task handles
-//! server accept, client egress, identity rotation, and metrics. Each
-//! event source is an arm of a single `tokio::select!`; heavy per-event
-//! work is spawned onto its own task so a slow handshake or dial does not
-//! block dispatch of the next event.
+//! server accept, client egress, banlist eviction, identity rotation,
+//! and metrics. Each event source is an arm of a single `tokio::select!`;
+//! heavy per-event work is spawned onto its own task so a slow handshake
+//! or dial does not block dispatch of the next event.
 
 use {
     crate::{
-        Banlist, EGRESS_CHANNEL_CAP,
+        Banlist, EGRESS_CHANNEL_CAP, HANDOVER_EVENTS_CHANNEL_CAP,
         admission::Admission,
         client::ClientConnection,
         close_codes,
@@ -55,6 +55,12 @@ pub struct Datagram {
 pub struct QuicDatagramEndpoint {
     pub endpoint: Endpoint,
     pub egress: mpsc::Sender<Datagram>,
+    /// Receiver for HANDOVER events: every pubkey of a peer that has closed
+    /// our connection with the `HANDOVER` close code is forwarded here.
+    /// Indicates a different instance of our validator identity has come
+    /// online and the remote node has switched to it. The consensus layer
+    /// should drain this receiver and decide whether to shut the node down.
+    pub handover_events: mpsc::Receiver<Pubkey>,
     /// Handle for rotating the local identity (TLS cert / pubkey). Wraps a
     /// `tokio::sync::watch` channel; the actual swap happens asynchronously
     /// in the control loop. Implements `solana_tls_utils::NotifyKeyUpdate`
@@ -103,6 +109,7 @@ impl QuicDatagramEndpoint {
         let table = Arc::new(ConnectionTable::new());
         let stats = Arc::<QuicDatagramStats>::default();
         let (egress_tx, egress_rx) = mpsc::channel(EGRESS_CHANNEL_CAP);
+        let (handover_tx, handover_rx) = mpsc::channel(HANDOVER_EVENTS_CHANNEL_CAP);
         let (key_updater, identity_rx) = KeyUpdater::new();
         let key_updater = Arc::new(key_updater);
 
@@ -113,6 +120,7 @@ impl QuicDatagramEndpoint {
             ingress,
             admission,
             banlist,
+            handover_events: handover_tx,
             identity_rx,
             connections: table,
             stats,
@@ -123,6 +131,7 @@ impl QuicDatagramEndpoint {
         Ok(Self {
             endpoint,
             egress: egress_tx,
+            handover_events: handover_rx,
             key_updater,
             task,
         })
@@ -145,6 +154,7 @@ struct EndpointLoop<A: Admission> {
     ingress: Sender<Datagram>,
     admission: Arc<A>,
     banlist: Arc<Banlist<Pubkey>>,
+    handover_events: mpsc::Sender<Pubkey>,
     identity_rx: watch::Receiver<Option<Arc<IdentitySnapshot>>>,
     connections: Arc<ConnectionTable>,
     stats: Arc<QuicDatagramStats>,
@@ -294,6 +304,7 @@ impl<A: Admission> EndpointLoop<A> {
             ingress: self.ingress.clone(),
             admission: self.admission.clone(),
             banlist: self.banlist.clone(),
+            handover_events: self.handover_events.clone(),
             table: self.connections.clone(),
             stats: self.stats.clone(),
         }
@@ -333,6 +344,7 @@ impl<A: Admission> EndpointLoop<A> {
             ingress: self.ingress.clone(),
             admission: self.admission.clone(),
             banlist: self.banlist.clone(),
+            handover_events: self.handover_events.clone(),
             table: self.connections.clone(),
             stats: self.stats.clone(),
         }

@@ -31,7 +31,9 @@ event source via a single `tokio::select!`:
 
 - server-accept (`endpoint.accept()`)
 - client egress (`egress_rx.recv()`)
+- banlist evictions (`banlist_evictions.recv()`)
 - identity rotation (`identity_rx.changed()`)
+- banlist-prune timer (hourly)
 - metrics-report timer (every 2 s)
 
 Heavy per-event work (TLS handshake, dial, etc.) is spawned onto its own
@@ -97,20 +99,15 @@ wasted dials against dead peers. Acceptable because the failure cost
 (one quinn `connect` + handshake-timeout) is bounded and the volume is
 votor-paced.
 
-## Connection replacement
+## Handover
 
 A new successful handshake from a pubkey already in `Established`
-closes the prior connection with `REPLACED` and installs the new one -
-the validator hot-spare path (a backup instance of a peer's identity
-re-dials). The displaced side observes `REPLACED` in its read loop and
-simply reaps the connection; it re-handshakes on its next send if it
-still has traffic for the peer.
-
-> Note: stake-weighted reaction to replacement (the "handover" /
-> self-shutdown mechanism), per-peer/per-subnet rate limiting, and the
-> external banlist are intentionally **not** part of this crate yet —
-> they land in a follow-up PR. This crate is the core datagram transport
-> only.
+closes the prior connection with `HANDOVER` and installs the new one -
+the validator hot-spare handover path. The displaced side observes
+`HANDOVER` in its read loop, soft-bans the evicting peer, and forwards
+the pubkey on the caller-supplied `handover_events` channel so the
+consensus layer can react (for example shut the node down once enough
+stake has handed us over).
 
 ## PEER_MOVED (address-aware eviction)
 
@@ -129,20 +126,28 @@ accepted, addr argument ignored on cache hit.
 
 ## Security posture
 
-This crate is the core transport. The protections present today are:
-
-1. **Bidirectional TLS ID validation.** Peer's cert must yield a
+1. **QUIC RETRY** (mandatory). Every inbound is bounced through a RETRY.
+   Blocks address-spoofed handshake floods - an attacker without a working
+   return path completes nothing and does not burn our CPU.
+2. **Per-subnet rate limit.** Post-RETRY (source addr is now validated),
+   bucket per /24 (v4). Catches the basic attack profile - baby cams and
+   residential routers flooding connection attempts. Loopback is
+   exempt. Same mechanism as with streamer. No IPv6 to keep this easy.
+3. **Bidirectional TLS ID validation.** Peer's cert must yield a
    recoverable Solana ed25519 pubkey; client checks the attested pubkey
-   matches the targeted one, server checks the inbound pubkey.
-2. **Stake check** (`Admission` trait, default impl
+   matches the targeted one, server checks that client owns a staked
+   identity.
+4. **Stake check** (`Admission` trait, default impl
    `StakedNodesAdmission`). Peer must be in the current staked-set
-   snapshot. IPv6 / multicast initiators are ignored at accept.
-3. **MAX_PEERS = 2000.** Defensive cap on the connection table.
-
-Deferred to a follow-up PR (not in this crate yet): QUIC RETRY
-address-validation, per-subnet handshake rate limiting, per-connection
-RX token-bucket rate limiting, and the application banlist (e.g. for BLS
-sigverify failures).
+   snapshot.
+5. **External banlist** (`DatagramBanlist`). Application-level bans
+   (e.g., BLS sigverify failures) are funneled through here; the
+   evictor task reaps every cached connection for the banned pubkey.
+6. **Per-connection RX token bucket.** Bursts above
+   `BURST_DATAGRAMS_PER_SECOND_PER_PEER` are silently dropped (the
+   bucket itself is the throttle). The connection stays alive; the
+   peer is **not** banned (consensus traffic legitimately bursts).
+7. **MAX_PEERS = 2000.** Defensive cap on the connection table.
 
 
 ## Identity rotation
@@ -181,6 +186,9 @@ under the cap.
 - **Ingress** (endpoint → caller, caller-supplied
   `crossbeam_channel::Sender`). Drop-on-full counted in
   `datagram_ingress_dropped_channel_full`.
+- **Handover events** (endpoint → caller, `HANDOVER_EVENTS_CHANNEL_CAP
+  = MAX_PEERS`). Sized so even the catastrophic "every peer hands us
+  over" scenario does not overflow.
 
 ### Epoch boundary handling
 
