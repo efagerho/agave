@@ -127,6 +127,23 @@ pub fn get_pubkey_from_tls_certificate(
     }
 }
 
+/// Recover the peer's Solana pubkey from a `quinn::Connection`. Accepts
+/// only a self-signed cert chain of length 1 (matches the cert shape
+/// produced by [`new_dummy_x509_certificate`]).
+///
+/// Single source of truth for the connection→pubkey extraction shared by
+/// `solana-streamer`, `solana-quic-datagram`, and anything else doing QUIC
+/// over Solana validator identities.
+pub fn get_remote_pubkey(connection: &quinn::Connection) -> Option<Pubkey> {
+    connection
+        .peer_identity()?
+        .downcast::<Vec<rustls::pki_types::CertificateDer>>()
+        .ok()
+        .filter(|certs| certs.len() == 1)?
+        .first()
+        .and_then(get_pubkey_from_tls_certificate)
+}
+
 /// Translate a SocketAddr into a valid SNI for the purposes of QUIC connection
 ///
 /// We do not actually check if the server holds a cert for this server_name
