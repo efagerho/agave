@@ -290,7 +290,10 @@ mod tests {
         solana_keypair::Keypair,
         solana_net_utils::{SocketAddrSpace, sockets::bind_to_localhost_unique},
         solana_pubkey::Pubkey as PubkeyAlias,
-        solana_quic_datagram::endpoint::{Datagram, QuicDatagramEndpoint},
+        solana_quic_datagram::{
+            Banlist,
+            endpoint::{Datagram, QuicDatagramEndpoint},
+        },
         solana_runtime::{
             bank::Bank,
             bank_forks::BankForks,
@@ -334,9 +337,16 @@ mod tests {
         let socket = bind_to_localhost_unique().expect("bind UDP");
         let addr = socket.local_addr().expect("local addr");
         let (ingress_tx, ingress_rx) = crossbeam_channel::bounded(4096);
-        let endpoint =
-            datagram_endpoint::spawn(rt.handle(), &keypair, socket, ingress_tx, admission)
-                .expect("datagram_endpoint::spawn");
+        let banlist = Arc::new(Banlist::<Pubkey>::default());
+        let endpoint = datagram_endpoint::spawn(
+            rt.handle(),
+            &keypair,
+            socket,
+            ingress_tx,
+            admission,
+            banlist,
+        )
+        .expect("datagram_endpoint::spawn");
         (endpoint, ingress_rx, addr, rt)
     }
 

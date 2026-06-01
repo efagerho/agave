@@ -3,7 +3,7 @@ use qualifier_attr::qualifiers;
 use {
     super::{errors::SigVerifyVoteError, stats::SigVerifyVoteStats},
     crate::bls_sigverify::{
-        bls_sigverifier::{NUM_SLOTS_FOR_VERIFY, SigVerifierChannels},
+        bls_sigverifier::{BAN_TIMEOUT, NUM_SLOTS_FOR_VERIFY, SigVerifierChannels},
         utils::{
             send_votes_to_metrics, send_votes_to_pool, send_votes_to_repair, send_votes_to_rewards,
         },
@@ -28,6 +28,7 @@ use {
     solana_ledger::leader_schedule_cache::LeaderScheduleCache,
     solana_measure::{measure::Measure, measure_us},
     solana_pubkey::Pubkey,
+    solana_quic_datagram::Banlist,
     solana_runtime::bank::Bank,
     std::{collections::HashMap, sync::Arc},
 };
@@ -66,12 +67,13 @@ impl VotePayload {
 /// Verifies votes and sends the verified votes to the consensus pool; and sends the desired subset
 /// to rewards container and repair.
 ///
-/// Votes that fail fallback individual signature verification are dropped.
+/// Any vote that fails fallback individual signature verification will have its sender banlisted.
 pub(super) fn verify_and_send_votes(
     votes_to_verify: Vec<VotePayload>,
     root_bank: &Bank,
     cluster_info: &ClusterInfo,
     leader_schedule: &LeaderScheduleCache,
+    banlist: &Banlist<Pubkey>,
     thread_pool: &ThreadPool,
     channels: &SigVerifierChannels,
 ) -> Result<SigVerifyVoteStats, SigVerifyVoteError> {
@@ -81,7 +83,7 @@ pub(super) fn verify_and_send_votes(
         return Ok(stats);
     }
     stats.votes_to_sig_verify += votes_to_verify.len() as u64;
-    let verified_votes = verify_votes(root_bank, votes_to_verify, &mut stats, thread_pool);
+    let verified_votes = verify_votes(root_bank, votes_to_verify, &mut stats, banlist, thread_pool);
     stats.sig_verified_votes += verified_votes.len() as u64;
 
     let (votes_for_pool, msgs_for_repair, msg_for_reward, msg_for_metrics) =
@@ -176,6 +178,7 @@ fn verify_votes(
     root_bank: &Bank,
     votes_to_verify: Vec<VotePayload>,
     stats: &mut SigVerifyVoteStats,
+    banlist: &Banlist<Pubkey>,
     thread_pool: &ThreadPool,
 ) -> Vec<VotePayload> {
     // Filter votes too far in the future.
@@ -196,16 +199,20 @@ fn verify_votes(
         return votes_to_verify;
     }
 
-    // Fallback to individual verification. Votes from senders that fail
-    // verification are simply dropped (banning of repeat offenders is a
-    // follow-up; see the slim-PR scope notes).
-    let ((verified_votes, _invalid_remote_pubkeys), time_us) =
-        measure_us!(verify_individual_votes(
-            votes_to_verify,
-            distinct_votes,
-            distinct_payloads,
-            thread_pool,
-        ));
+    // Fallback to individual verification
+    let ((verified_votes, invalid_remote_pubkeys), time_us) = measure_us!(verify_individual_votes(
+        votes_to_verify,
+        distinct_votes,
+        distinct_payloads,
+        thread_pool,
+    ));
+    for remote_pubkey in invalid_remote_pubkeys {
+        if banlist.ban(remote_pubkey, BAN_TIMEOUT) {
+            stats.already_banned += 1;
+        } else {
+            info!("bls_vote_sigverify: banned sender={remote_pubkey} due to failed verification");
+        }
+    }
     stats.fn_verify_individual_votes_stats.add_sample(time_us);
 
     verified_votes

@@ -44,7 +44,13 @@ pub(crate) const NOT_ADMITTED: Spec = Spec {
     reason: b"NOT_ADMITTED",
 };
 
-/// Peer is in the local [`crate::Banlist<Pubkey>`] — either via an external
+/// Peer is in the local [`crate::Banlist`] — e.g. an external trigger
+/// such as a BLS signature-verification failure.
+pub(crate) const BANNED: Spec = Spec {
+    code: VarInt::from_u32(4),
+    reason: b"BANNED",
+};
+
 /// Connection table is at [`crate::MAX_PEERS`] and this is a fresh pubkey
 /// — no slot available.
 pub(crate) const TABLE_FULL: Spec = Spec {

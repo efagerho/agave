@@ -29,6 +29,7 @@ use {
     solana_poh_config::PohConfig,
     solana_pubkey::Pubkey,
     solana_quic_datagram::{
+        Banlist,
         admission::AllowAll,
         endpoint::{Datagram, QuicDatagramEndpoint},
     },
@@ -478,12 +479,14 @@ pub fn start_datagram_listener_for_votes_and_certs(
         .build()
         .expect("tokio runtime");
     let (sender, receiver) = crossbeam_channel::unbounded();
+    let banlist = Arc::new(Banlist::<Pubkey>::default());
     let endpoint = agave_votor::datagram_endpoint::spawn(
         rt.handle(),
         &listener_keypair,
         vote_listener_socket,
         sender,
         Arc::new(AllowAll),
+        banlist,
     )
     .expect("alpenglow datagram listener");
     (endpoint, receiver, rt)

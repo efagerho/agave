@@ -1225,7 +1225,7 @@ impl Validator {
         } else {
             None
         };
-        let (votor_egress, votor_ingress, votor_admission, _alpenglow_endpoint_task) =
+        let (votor_egress, votor_ingress, votor_banlist, votor_admission, _alpenglow_endpoint_task) =
             if let Some(socket) = alpenglow_socket {
                 let votor_rt_handle = tpu_client_next_runtime
                     .as_ref()
@@ -1233,6 +1233,7 @@ impl Validator {
                     .unwrap_or_else(|| current_runtime_handle.as_ref().unwrap());
                 let (ingress_tx, ingress_rx) =
                     crossbeam_channel::bounded(crate::tvu::MAX_ALPENGLOW_PACKET_NUM);
+                let banlist = Arc::new(solana_quic_datagram::Banlist::<Pubkey>::default());
                 // Seed admission synchronously with the current epoch's
                 // staked-set so the endpoint never accepts handshakes
                 // against an empty allow-list. The StakedValidatorsCache
@@ -1250,18 +1251,20 @@ impl Validator {
                     socket,
                     ingress_tx,
                     admission.clone(),
+                    banlist.clone(),
                 )
                 .map_err(|e| ValidatorError::Other(format!("alpenglow endpoint: {e:?}")))?;
                 key_notifiers
                     .write()
                     .unwrap()
                     .add(KeyUpdaterType::VotorDatagram, key_updater);
-                (egress, ingress_rx, Some(admission), Some(task))
+                (egress, ingress_rx, banlist, Some(admission), Some(task))
             } else {
                 let (egress, _) = tokio::sync::mpsc::channel(1);
                 let (_, ingress) =
                     crossbeam_channel::bounded::<solana_quic_datagram::endpoint::Datagram>(1);
-                (egress, ingress, None, None)
+                let banlist = Arc::new(solana_quic_datagram::Banlist::<Pubkey>::default());
+                (egress, ingress, banlist, None, None)
             };
 
         let rpc_override_health_check =
@@ -1699,6 +1702,7 @@ impl Validator {
                 key_notifiers: key_notifiers.clone(),
                 votor_egress,
                 votor_ingress,
+                votor_banlist,
                 votor_admission,
                 voting_service_test_override: config.voting_service_test_override.clone(),
                 highest_finalized,

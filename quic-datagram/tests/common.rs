@@ -10,6 +10,7 @@ use {
     solana_net_utils::sockets::bind_to_localhost_unique,
     solana_pubkey::Pubkey,
     solana_quic_datagram::{
+        Banlist,
         admission::Admission,
         endpoint::{Datagram, QuicDatagramEndpoint},
     },
@@ -24,6 +25,7 @@ pub struct TestNode {
     pub addr: SocketAddr,
     pub endpoint: QuicDatagramEndpoint,
     pub ingress_rx: Receiver<Datagram>,
+    pub banlist: Arc<Banlist<Pubkey>>,
 }
 
 impl TestNode {
@@ -55,6 +57,7 @@ pub fn spawn_node_with<A: Admission>(
     let socket = bind_to_localhost_unique().expect("bind UDP socket");
     let addr = socket.local_addr().expect("local addr");
     let (ingress_tx, ingress_rx) = crossbeam_channel::bounded(4096);
+    let banlist = Arc::new(Banlist::<Pubkey>::default());
     let endpoint = QuicDatagramEndpoint::new(
         rt.handle(),
         &keypair,
@@ -62,6 +65,7 @@ pub fn spawn_node_with<A: Admission>(
         TEST_ALPN,
         ingress_tx,
         admission,
+        banlist.clone(),
     )
     .expect("QuicDatagramEndpoint::new");
     TestNode {
@@ -69,6 +73,7 @@ pub fn spawn_node_with<A: Admission>(
         addr,
         endpoint,
         ingress_rx,
+        banlist,
     }
 }
 

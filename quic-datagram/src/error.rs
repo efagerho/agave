@@ -30,6 +30,10 @@ pub enum Error {
     #[error("peer {0} is not admitted (unstaked)")]
     NotAdmitted(Pubkey),
 
+    /// Peer pubkey is currently banned.
+    #[error("peer {0} is banned")]
+    Banned(Pubkey),
+
     /// Connection table already holds [`crate::MAX_PEERS`] distinct pubkeys
     /// and the incoming peer is not among them.
     #[error("connection table full")]

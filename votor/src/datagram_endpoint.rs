@@ -14,7 +14,7 @@ use {
     solana_keypair::Keypair,
     solana_pubkey::Pubkey,
     solana_quic_datagram::{
-        Admission, Error, StakedNodesAdmission,
+        Admission, Banlist, Error, StakedNodesAdmission,
         endpoint::{Datagram, QuicDatagramEndpoint},
     },
     solana_runtime::bank_forks::BankForks,
@@ -31,8 +31,8 @@ use {
 pub const ALPENGLOW_ALPN: &[u8] = b"alpenglow-v1";
 
 /// Construct a [`QuicDatagramEndpoint`] tuned for alpenglow consensus
-/// traffic. Caller owns admission and ingress; the returned endpoint owns
-/// its control loop task.
+/// traffic. Caller owns admission, banlist and ingress; the returned
+/// endpoint owns its control loop task.
 ///
 /// **Identity rotation** — register `endpoint.key_updater.clone()` with
 /// the validator's `KeyUpdaters` registry (implements
@@ -47,8 +47,17 @@ pub fn spawn<A: Admission>(
     socket: UdpSocket,
     ingress: Sender<Datagram>,
     admission: Arc<A>,
+    banlist: Arc<Banlist<Pubkey>>,
 ) -> Result<QuicDatagramEndpoint, Error> {
-    QuicDatagramEndpoint::new(runtime, keypair, socket, ALPENGLOW_ALPN, ingress, admission)
+    QuicDatagramEndpoint::new(
+        runtime,
+        keypair,
+        socket,
+        ALPENGLOW_ALPN,
+        ingress,
+        admission,
+        banlist,
+    )
 }
 
 /// Build the set of validator pubkeys whose stake is positive in the

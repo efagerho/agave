@@ -3,7 +3,8 @@
 
 use {
     crate::{
-        BURST_DATAGRAMS_PER_SECOND_PER_PEER, MAX_DATAGRAMS_PER_SECOND_PER_PEER,
+        BURST_DATAGRAMS_PER_SECOND_PER_PEER, Banlist, MAX_DATAGRAMS_PER_SECOND_PER_PEER,
+        close_codes,
         endpoint::Datagram,
         error::Error,
         stats::{QuicDatagramStats, record_error},
@@ -20,13 +21,14 @@ use {
 };
 
 /// Drive the per-connection read loop to completion. Returns when the
-/// connection closes (peer-initiated or ingress disconnect). Caller is
-/// responsible for reaping the connection table entry afterwards.
+/// connection closes (peer-initiated, banlist-trip, or ingress disconnect).
+/// Caller is responsible for reaping the connection table entry afterwards.
 pub(crate) async fn read_datagram_loop(
     connection: Connection,
     peer: Pubkey,
     remote_addr: SocketAddr,
     ingress: Sender<Datagram>,
+    banlist: Arc<Banlist<Pubkey>>,
     stats: Arc<QuicDatagramStats>,
 ) {
     // Per-connection rate limiter. Any datagram arriving with the bucket
@@ -40,6 +42,13 @@ pub(crate) async fn read_datagram_loop(
     loop {
         match connection.read_datagram().await {
             Ok(bytes) => {
+                // Banlist check happens AFTER the read so a ban that
+                // lands while we're awaiting can't let a follow-up
+                // datagram leak through to ingress.
+                if banlist.is_banned(&peer) {
+                    close_codes::BANNED.close(&connection);
+                    break;
+                }
                 if rate_limit.consume_tokens(1).is_err() {
                     drop(bytes);
                     stats.datagram_rate_limited.fetch_add(1, Ordering::Relaxed);

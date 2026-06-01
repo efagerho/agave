@@ -30,6 +30,7 @@ pub(crate) struct QuicDatagramStats {
     // Identity / admission
     pub(crate) invalid_identity: AtomicU64,
     pub(crate) handshake_rejected_not_admitted: AtomicU64,
+    pub(crate) handshake_rejected_banned: AtomicU64,
     pub(crate) handshake_rejected_table_full: AtomicU64,
     pub(crate) handshake_rejected_wrong_direction: AtomicU64,
     /// Source IP's subnet exceeded its handshake-attempt budget
@@ -122,6 +123,7 @@ pub(crate) fn record_error(err: &Error, stats: &QuicDatagramStats) {
         }
         Error::InvalidIdentity(_) => add(&stats.invalid_identity),
         Error::NotAdmitted(_) => add(&stats.handshake_rejected_not_admitted),
+        Error::Banned(_) => add(&stats.handshake_rejected_banned),
         Error::TableFull => add(&stats.handshake_rejected_table_full),
         Error::WrongDirection(_) => add(&stats.handshake_rejected_wrong_direction),
         Error::SendDatagram(SendDatagramError::ConnectionLost(_)) => {
@@ -229,6 +231,11 @@ pub(crate) fn report(stats: &QuicDatagramStats) {
         (
             "handshake_rejected_not_admitted",
             swap!(stats.handshake_rejected_not_admitted),
+            i64
+        ),
+        (
+            "handshake_rejected_banned",
+            swap!(stats.handshake_rejected_banned),
             i64
         ),
         (

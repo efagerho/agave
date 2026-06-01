@@ -2,6 +2,7 @@
 
 use {
     crate::{
+        Banlist,
         admission::Admission,
         close_codes,
         connection_table::{ConnectionTable, InsertOutcome},
@@ -24,6 +25,7 @@ pub(crate) struct ServerConnection<A: Admission> {
     pub(crate) local_pubkey: Pubkey,
     pub(crate) ingress: Sender<Datagram>,
     pub(crate) admission: Arc<A>,
+    pub(crate) banlist: Arc<Banlist<Pubkey>>,
     pub(crate) table: Arc<ConnectionTable>,
     pub(crate) stats: Arc<QuicDatagramStats>,
 }
@@ -68,6 +70,10 @@ impl<A: Admission> ServerConnection<A> {
             return Err(Error::WrongDirection(peer));
         }
 
+        if self.banlist.is_banned(&peer) {
+            close_codes::BANNED.close(&connection);
+            return Err(Error::Banned(peer));
+        }
         if !self.admission.allow(&peer) {
             close_codes::NOT_ADMITTED.close(&connection);
             return Err(Error::NotAdmitted(peer));
@@ -97,7 +103,15 @@ impl<A: Admission> ServerConnection<A> {
         // We're already on the per-incoming task; run the read loop
         // inline rather than chaining another spawn.
         let stable_id = connection.stable_id();
-        read_datagram_loop(connection, peer, remote_addr, self.ingress, self.stats).await;
+        read_datagram_loop(
+            connection,
+            peer,
+            remote_addr,
+            self.ingress,
+            self.banlist,
+            self.stats,
+        )
+        .await;
         // Reap our slot only if it still points at *this* connection
         // (a newer one may have taken our place).
         self.table.maybe_reap_connection(&peer, stable_id);

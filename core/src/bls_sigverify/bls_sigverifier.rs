@@ -26,7 +26,7 @@ use {
     solana_ledger::leader_schedule_cache::LeaderScheduleCache,
     solana_measure::measure_us,
     solana_pubkey::Pubkey,
-    solana_quic_datagram::endpoint::Datagram,
+    solana_quic_datagram::{Banlist, endpoint::Datagram},
     solana_runtime::{bank::Bank, bank_forks::SharableBanks},
     std::{
         collections::HashSet,
@@ -45,8 +45,13 @@ use {
 /// This also sets an upper bound on how much storage the various structs in this module require.
 pub(super) const NUM_SLOTS_FOR_VERIFY: Slot = 90_000;
 
+/// If we receive an invalid certificate or vote from a QUIC connection, we ban the sender.
+/// We ban the sender for 2 days which roughly corresponds to an epoch
+pub(super) const BAN_TIMEOUT: Duration = Duration::from_hours(48);
+
 pub(crate) struct SigVerifierContext {
     pub(crate) migration_status: Arc<MigrationStatus>,
+    pub(crate) banlist: Arc<Banlist<Pubkey>>,
     pub(crate) sharable_banks: SharableBanks,
     pub(crate) cluster_info: Arc<ClusterInfo>,
     pub(crate) leader_schedule: Arc<LeaderScheduleCache>,
@@ -78,6 +83,7 @@ pub(crate) fn spawn_service(
 
 struct SigVerifier {
     migration_status: Arc<MigrationStatus>,
+    banlist: Arc<Banlist<Pubkey>>,
     channels: SigVerifierChannels,
     /// Container to look up root banks from.
     sharable_banks: SharableBanks,
@@ -97,6 +103,7 @@ impl SigVerifier {
     fn new(context: SigVerifierContext, channels: SigVerifierChannels) -> Self {
         let SigVerifierContext {
             migration_status,
+            banlist,
             sharable_banks,
             cluster_info,
             leader_schedule,
@@ -111,6 +118,7 @@ impl SigVerifier {
         let root_slot = sharable_banks.root().slot();
         Self {
             migration_status,
+            banlist,
             channels,
             sharable_banks,
             stats: SigVerifierStats::new(root_slot),
@@ -164,6 +172,7 @@ impl SigVerifier {
                     &root_bank,
                     &self.cluster_info,
                     &self.leader_schedule,
+                    &self.banlist,
                     &self.thread_pool,
                     &self.channels,
                 )
@@ -174,6 +183,7 @@ impl SigVerifier {
                     certs_to_verify,
                     &root_bank,
                     &self.channels.channel_to_pool,
+                    &self.banlist,
                     &self.thread_pool,
                 )
             },
@@ -239,7 +249,10 @@ impl SigVerifier {
                         self.stats.num_generated_certs_received += 1;
                         continue;
                     }
-                    certs.push(CertPayload { cert });
+                    certs.push(CertPayload {
+                        cert,
+                        remote_pubkey,
+                    });
                 }
             }
         }
@@ -344,9 +357,14 @@ mod tests {
         solana_signer_store::encode_base2,
     };
 
+    fn new_test_banlist() -> Arc<Banlist<Pubkey>> {
+        Arc::new(Banlist::<Pubkey>::default())
+    }
+
     struct TestContext {
         verifier: SigVerifier,
         validator_keypairs: Vec<ValidatorVoteKeypairs>,
+        banlist: Arc<Banlist<Pubkey>>,
 
         _packet_sender: Sender<Datagram>,
         repair_receiver: VerifiedVoterSlotsReceiver,
@@ -398,9 +416,11 @@ mod tests {
             let (channel_to_metrics, metrics_receiver) = crossbeam_channel::unbounded();
 
             let generated_cert_types = Arc::new(GeneratedCertTypes::default());
+            let banlist = new_test_banlist();
             let verifier = SigVerifier::new(
                 SigVerifierContext {
                     migration_status: Arc::new(MigrationStatus::default()),
+                    banlist: banlist.clone(),
                     sharable_banks,
                     cluster_info,
                     leader_schedule,
@@ -418,6 +438,7 @@ mod tests {
             Self {
                 validator_keypairs,
                 verifier,
+                banlist,
                 _packet_sender: packet_sender,
                 repair_receiver,
                 _reward_receiver: reward_receiver,
@@ -1205,6 +1226,7 @@ mod tests {
         let mut sig_verifier = SigVerifier::new(
             SigVerifierContext {
                 migration_status: Arc::new(MigrationStatus::default()),
+                banlist: new_test_banlist(),
                 sharable_banks,
                 cluster_info,
                 leader_schedule,
@@ -1299,6 +1321,122 @@ mod tests {
         expect_no_receive(&ctx.pool_receiver);
         assert_eq!(ctx.verifier.stats.num_verified_certs_received, 1);
         assert_eq!(ctx.verifier.stats.cert_stats.certs_to_sig_verify, 0);
+    }
+
+    #[test]
+    fn test_banlist_not_updated_for_valid_vote_and_cert() {
+        let mut ctx = TestContext::new();
+
+        let vote_message = ConsensusMessage::Vote(create_signed_vote_message(
+            &ctx.validator_keypairs,
+            Vote::new_skip_vote(42),
+            0,
+        ));
+        let cert_message = ConsensusMessage::Certificate(create_signed_certificate_message(
+            &ctx.validator_keypairs,
+            CertificateType::Notarize(43, Hash::new_unique()),
+            &(0..7).collect::<Vec<_>>(),
+        ));
+        let vote_sender = Pubkey::new_unique();
+        let cert_sender = Pubkey::new_unique();
+        let items = messages_to_items_with_remote_pubkeys(&[
+            (vote_message, vote_sender),
+            (cert_message, cert_sender),
+        ]);
+
+        ctx.verifier.verify_and_send_batches(items).unwrap();
+        assert_eq!(ctx.pool_receiver.try_iter().flatten().count(), 2);
+        assert!(!ctx.banlist.is_banned(&vote_sender));
+        assert!(!ctx.banlist.is_banned(&cert_sender));
+    }
+
+    #[test]
+    fn test_banlist_updates_for_invalid_votes() {
+        let mut ctx = TestContext::new();
+
+        let vote = Vote::new_skip_vote(42);
+        let valid_payload = wincode::serialize(&vote).unwrap();
+        let invalid_payload = wincode::serialize(&Vote::new_skip_vote(999)).unwrap();
+        let invalid_indexes = [1usize, 3usize];
+        let messages: Vec<_> = ctx
+            .validator_keypairs
+            .iter()
+            .enumerate()
+            .take(5)
+            .map(|(i, keypair)| {
+                let signature = if invalid_indexes.contains(&i) {
+                    keypair.bls_keypair.sign(&invalid_payload).into()
+                } else {
+                    keypair.bls_keypair.sign(&valid_payload).into()
+                };
+                let message = ConsensusMessage::Vote(VoteMessage {
+                    vote,
+                    signature,
+                    rank: i as u16,
+                });
+                (message, Pubkey::new_unique())
+            })
+            .collect();
+
+        ctx.verifier
+            .verify_and_send_batches(messages_to_items_with_remote_pubkeys(&messages))
+            .unwrap();
+        assert_eq!(ctx.pool_receiver.try_iter().flatten().count(), 3);
+
+        for (i, (_, sender)) in messages.iter().enumerate() {
+            if invalid_indexes.contains(&i) {
+                assert!(
+                    ctx.banlist.is_banned(sender),
+                    "invalid sender {i} should be banned"
+                );
+            } else {
+                assert!(
+                    !ctx.banlist.is_banned(sender),
+                    "valid sender {i} should not be banned"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_banlist_updates_for_invalid_certificates() {
+        let mut ctx = TestContext::new();
+
+        let invalid_indexes = [0usize, 4usize];
+        let messages: Vec<_> = (0..5)
+            .map(|i| {
+                let slot = 10 + i as u64;
+                let cert_type = CertificateType::Notarize(slot, Hash::new_unique());
+                let mut cert = create_signed_certificate_message(
+                    &ctx.validator_keypairs,
+                    cert_type,
+                    &(0..7).collect::<Vec<_>>(),
+                );
+                if invalid_indexes.contains(&i) {
+                    cert.signature = Signature([0; BLS_SIGNATURE_AFFINE_SIZE]);
+                }
+                (ConsensusMessage::Certificate(cert), Pubkey::new_unique())
+            })
+            .collect();
+
+        ctx.verifier
+            .verify_and_send_batches(messages_to_items_with_remote_pubkeys(&messages))
+            .unwrap();
+        assert_eq!(ctx.pool_receiver.try_iter().flatten().count(), 3);
+
+        for (i, (_, sender)) in messages.iter().enumerate() {
+            if invalid_indexes.contains(&i) {
+                assert!(
+                    ctx.banlist.is_banned(sender),
+                    "invalid sender {i} should be banned"
+                );
+            } else {
+                assert!(
+                    !ctx.banlist.is_banned(sender),
+                    "valid sender {i} should not be banned"
+                );
+            }
+        }
     }
 
     #[test]

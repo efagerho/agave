@@ -13,10 +13,15 @@
 //! generated pubkey" scenario. It's a hot-spare failover: a non-voting
 //! backup running with a throwaway keypair gets promoted by being
 //! handed the staked keypair already in use by the primary. After
-//! rotation the new pubkey is already in every peer's admission set (it
-//! was staked the whole time — it's the primary's identity), so peers
-//! accept the second connection from the same staked pubkey and replace
-//! the primary's connection.
+//! rotation:
+//!   - The new pubkey is already in every peer's admission set (it
+//!     was staked the whole time — it's the primary's identity).
+//!   - Peers observe a second connection from the same staked pubkey
+//!     and replace the primary's connection via HANDOVER.
+//!   - The primary receives HANDOVER closes, soft-bans the evicting
+//!     peers (so it doesn't redial and ping-pong), and once 41% of
+//!     stake has handed it over the handover_shutdown thread sets
+//!     its exit flag.
 //!
 //! This test uses two arbitrary keypairs (K1 → K2) with `AllowAll`
 //! admission on the server side; that exercises the rotation
@@ -30,7 +35,9 @@ use {
     solana_keypair::{Keypair, Signer},
     solana_net_utils::sockets::bind_to_localhost_unique,
     solana_pubkey::Pubkey,
-    solana_quic_datagram::{StakedNodesAdmission, admission::AllowAll, endpoint::Datagram},
+    solana_quic_datagram::{
+        Banlist, StakedNodesAdmission, admission::AllowAll, endpoint::Datagram,
+    },
     solana_tls_utils::NotifyKeyUpdate,
     std::{
         collections::HashSet,
@@ -98,12 +105,14 @@ fn identity_rotation_via_votor_wrapper() {
     let server_socket = bind_to_localhost_unique().expect("server bind");
     let server_addr = server_socket.local_addr().expect("server addr");
     let (server_ingress_tx, server_ingress_rx) = crossbeam_channel::bounded(4096);
+    let server_banlist = Arc::new(Banlist::<Pubkey>::default());
     let server = datagram_endpoint::spawn(
         rt.handle(),
         &server_kp,
         server_socket,
         server_ingress_tx,
         Arc::new(AllowAll),
+        server_banlist,
     )
     .expect("server endpoint");
 
@@ -113,6 +122,7 @@ fn identity_rotation_via_votor_wrapper() {
     let k1_pubkey = k1.pubkey();
     let client_socket = bind_to_localhost_unique().expect("client bind");
     let (client_ingress_tx, _client_ingress_rx) = crossbeam_channel::bounded(4096);
+    let client_banlist = Arc::new(Banlist::<Pubkey>::default());
     // Client admission must include server_pubkey so its dial-side
     // admission check passes. Use a StakedNodesAdmission populated
     // with the server's pubkey (mirrors how the cache would seed it
@@ -125,6 +135,7 @@ fn identity_rotation_via_votor_wrapper() {
         client_socket,
         client_ingress_tx,
         Arc::new(StakedNodesAdmission::new(admit)),
+        client_banlist,
     )
     .expect("client endpoint");
 
@@ -174,8 +185,9 @@ fn identity_rotation_via_votor_wrapper() {
     );
 
     // Identity rotation is the local endpoint closing its own
-    // connections with IDENTITY_ROTATED. The peer's read loop reaps the
-    // entry and accepts the fresh K2 handshake on the next send.
+    // connections with IDENTITY_ROTATED — not a HANDOVER event for
+    // the peer. The peer's read loop reaps the entry without soft-ban
+    // and accepts the fresh K2 handshake on the next send.
     drop(client);
     drop(server);
 }

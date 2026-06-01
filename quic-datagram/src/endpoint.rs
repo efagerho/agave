@@ -7,7 +7,7 @@
 
 use {
     crate::{
-        EGRESS_CHANNEL_CAP,
+        Banlist, EGRESS_CHANNEL_CAP,
         admission::Admission,
         client::ClientConnection,
         close_codes,
@@ -38,6 +38,7 @@ use {
     },
 };
 
+const BANLIST_PRUNE_INTERVAL: Duration = Duration::from_secs(60 * 60);
 const METRICS_INTERVAL: Duration = Duration::from_secs(2);
 
 /// Datagram envelope used on both directions of the endpoint.
@@ -69,6 +70,8 @@ impl QuicDatagramEndpoint {
     /// (counted in `datagram_ingress_dropped_channel_full`).
     ///
     /// `admission` is consulted once per new connection in either direction.
+    /// `banlist` is consulted on every send and at handshake.
+    #[allow(clippy::too_many_arguments)]
     pub fn new<A: Admission>(
         runtime: &tokio::runtime::Handle,
         keypair: &Keypair,
@@ -76,6 +79,7 @@ impl QuicDatagramEndpoint {
         alpn_protocol_id: &'static [u8],
         ingress: Sender<Datagram>,
         admission: Arc<A>,
+        banlist: Arc<Banlist<Pubkey>>,
     ) -> Result<Self, Error> {
         let local_pubkey = keypair.pubkey();
         let (cert, key) = new_dummy_x509_certificate(keypair);
@@ -108,6 +112,7 @@ impl QuicDatagramEndpoint {
             egress_rx,
             ingress,
             admission,
+            banlist,
             identity_rx,
             connections: table,
             stats,
@@ -139,6 +144,7 @@ struct EndpointLoop<A: Admission> {
     egress_rx: mpsc::Receiver<Datagram>,
     ingress: Sender<Datagram>,
     admission: Arc<A>,
+    banlist: Arc<Banlist<Pubkey>>,
     identity_rx: watch::Receiver<Option<Arc<IdentitySnapshot>>>,
     connections: Arc<ConnectionTable>,
     stats: Arc<QuicDatagramStats>,
@@ -150,6 +156,9 @@ struct EndpointLoop<A: Admission> {
 impl<A: Admission> EndpointLoop<A> {
     async fn run(mut self) {
         let subnet_limit = Arc::new(SubnetRateLimiter::new());
+
+        let mut prune = tokio::time::interval(BANLIST_PRUNE_INTERVAL);
+        prune.set_missed_tick_behavior(MissedTickBehavior::Skip);
 
         let mut metrics = tokio::time::interval(METRICS_INTERVAL);
         metrics.set_missed_tick_behavior(MissedTickBehavior::Skip);
@@ -197,6 +206,7 @@ impl<A: Admission> EndpointLoop<A> {
                 }
                 // when idle we can take care of bookkeeping. If these are delayed
                 // it is usually not a problem.
+                _ = prune.tick() => self.banlist.prune(),
                 _ = metrics.tick() => stats::report(&self.stats),
             }
         }
@@ -230,6 +240,9 @@ impl<A: Admission> EndpointLoop<A> {
             message: bytes,
         } = dg;
         debug_assert_ne!(self.local_pubkey, peer, "egress to self is a caller bug");
+        if self.banlist.is_banned(&peer) {
+            return;
+        }
         // Lex rule partition connection directions: lex-higher side
         // only ever holds inbound (server-accepted) entries; lex-lower side
         // only ever holds outbound (we-dialed) ones.
@@ -280,6 +293,7 @@ impl<A: Admission> EndpointLoop<A> {
             trigger: bytes,
             ingress: self.ingress.clone(),
             admission: self.admission.clone(),
+            banlist: self.banlist.clone(),
             table: self.connections.clone(),
             stats: self.stats.clone(),
         }
@@ -318,6 +332,7 @@ impl<A: Admission> EndpointLoop<A> {
             local_pubkey: self.local_pubkey,
             ingress: self.ingress.clone(),
             admission: self.admission.clone(),
+            banlist: self.banlist.clone(),
             table: self.connections.clone(),
             stats: self.stats.clone(),
         }

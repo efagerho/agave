@@ -2,6 +2,7 @@
 
 use {
     crate::{
+        Banlist,
         admission::Admission,
         close_codes,
         connection_table::{ConnectionTable, IdGeneration, InsertOutcome},
@@ -34,6 +35,7 @@ pub(crate) struct ClientConnection<A: Admission> {
     pub(crate) trigger: Bytes,
     pub(crate) ingress: Sender<Datagram>,
     pub(crate) admission: Arc<A>,
+    pub(crate) banlist: Arc<Banlist<Pubkey>>,
     pub(crate) table: Arc<ConnectionTable>,
     pub(crate) stats: Arc<QuicDatagramStats>,
 }
@@ -102,7 +104,15 @@ impl<A: Admission> ClientConnection<A> {
 
             // Drive the read loop inline.
             let stable_id = connection.stable_id();
-            read_datagram_loop(connection, self.peer, self.addr, self.ingress, self.stats).await;
+            read_datagram_loop(
+                connection,
+                self.peer,
+                self.addr,
+                self.ingress,
+                self.banlist,
+                self.stats,
+            )
+            .await;
             // Reap our slot only if it still points at *this* connection
             // (a replacement could have taken its place).
             self.table.maybe_reap_connection(&self.peer, stable_id);

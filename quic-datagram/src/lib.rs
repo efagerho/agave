@@ -15,12 +15,26 @@ pub(crate) mod stats;
 pub(crate) mod subnet_rate_limit;
 pub(crate) mod transport;
 
+use std::time::Duration;
 pub use {
     admission::{Admission, StakedNodesAdmission},
     endpoint::QuicDatagramEndpoint,
     error::Error,
     key_updater::KeyUpdater,
+    solana_net_utils::banlist::Banlist,
 };
+
+/// Ban duration applied by the crate's only internal trigger: HANDOVER
+/// reception in the per-connection read loop. Short window because the
+/// peer may legitimately be retrying a hot-spare promotion.
+pub const BAN_DURATION_SHORT: Duration = Duration::from_hours(1);
+
+/// Ban duration intended for external triggers such as BLS signature
+/// verification failures. Currently unused inside this crate; external
+/// consumers (e.g. `core::bls_sigverify`) define their own equivalent
+/// constants. Re-exported so a future caller can adopt this without
+/// re-deriving the value.
+pub const BAN_DURATION_LONG: Duration = Duration::from_hours(48);
 
 /// Maximum number of unique peer pubkeys held in the connection table.
 /// Sized for the maximum expected alpenglow staked-node count.

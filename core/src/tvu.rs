@@ -58,7 +58,7 @@ use {
     },
     solana_poh::{poh_controller::PohController, poh_recorder::PohRecorder},
     solana_pubkey::Pubkey,
-    solana_quic_datagram::endpoint::Datagram,
+    solana_quic_datagram::{Banlist, endpoint::Datagram},
     solana_rpc::{
         max_slots::MaxSlots, optimistically_confirmed_bank_tracker::BankNotificationSenderConfig,
         rpc_subscriptions::RpcSubscriptions, slot_status_notifier::SlotStatusNotifier,
@@ -181,11 +181,14 @@ pub struct AlpenglowInitializationState {
     pub key_notifiers: Arc<RwLock<KeyUpdaters>>,
 
     // Votor QUIC datagram transport handles. Egress goes to the BLS
-    // voting service; ingress feeds the BLS sigverifier. `votor_admission`
-    // is owned by the voting service's StakedValidatorsCache, which
-    // republishes the staked-pubkey set on every epoch boundary.
+    // voting service; ingress feeds the BLS sigverifier; banlist is shared
+    // with the sigverifier so external triggers (e.g. signature failure)
+    // can soft-ban peers. `votor_admission` is owned by the voting
+    // service's StakedValidatorsCache, which republishes the staked-pubkey
+    // set on every epoch boundary.
     pub votor_egress: tokio::sync::mpsc::Sender<solana_quic_datagram::endpoint::Datagram>,
     pub votor_ingress: Receiver<Datagram>,
+    pub votor_banlist: Arc<Banlist<Pubkey>>,
     pub votor_admission: Option<Arc<solana_quic_datagram::StakedNodesAdmission>>,
     pub voting_service_test_override: Option<VotingServiceOverride>,
 
@@ -273,6 +276,7 @@ impl Tvu {
             key_notifiers: _key_notifiers,
             votor_egress,
             votor_ingress,
+            votor_banlist,
             votor_admission,
             voting_service_test_override,
             highest_finalized,
@@ -306,6 +310,7 @@ impl Tvu {
                 exit.clone(),
                 SigVerifierContext {
                     migration_status: migration_status.clone(),
+                    banlist: votor_banlist,
                     sharable_banks,
                     cluster_info: cluster_info.clone(),
                     leader_schedule: leader_schedule_cache.clone(),
@@ -784,6 +789,7 @@ pub mod tests {
         // are never connected to each other; ingress simply never fires.
         let (votor_egress, _votor_egress_rx) = tokio::sync::mpsc::channel(1024);
         let (_votor_ingress_tx, votor_ingress) = bounded(1024);
+        let votor_banlist = Arc::new(Banlist::<Pubkey>::default());
         let replay_highest_frozen = Arc::new(ReplayHighestFrozen::default());
         let (leader_window_info_sender, _leader_window_info_receiver) = unbounded();
         let (optimistic_parent_sender, optimistic_parent_receiver) = unbounded();
@@ -879,6 +885,7 @@ pub mod tests {
                 key_notifiers,
                 votor_egress,
                 votor_ingress,
+                votor_banlist,
                 votor_admission: None,
                 voting_service_test_override: None,
                 highest_finalized: Arc::new(RwLock::new(None)),
