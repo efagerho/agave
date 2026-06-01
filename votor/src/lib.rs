@@ -10,6 +10,7 @@ pub mod consensus_metrics;
 pub mod consensus_pool;
 mod consensus_pool_service;
 pub mod consensus_rewards;
+pub mod datagram_endpoint;
 pub mod event;
 mod event_handler;
 pub mod generated_cert_types;
