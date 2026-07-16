@@ -1,0 +1,64 @@
+dynamic_port_range = "8010-8030"                # --dynamic-port-range
+
+[interfaces."eth0"]                              # --xdp-interface
+zero_copy = true                                 # --xdp-zero-copy
+queue_to_cpu_mapping = ["0:8", "1:9", "2:10", "3:11"]
+
+[turbine.xdp]
+tx = ["eth0:0", "eth0:1"]                        # spreads egress over queues 0,1
+
+[repair.bind]
+serve_repair = "0.0.0.0:8003"
+ancestor_hashes = "0.0.0.0:8004"
+[repair.xdp]
+tx = ["eth0:2"]
+
+[gossip]
+entrypoints = [
+    "entrypoint.mainnet-beta.solana.com:8001",
+    "entrypoint2.mainnet-beta.solana.com:8001",
+]
+known_validators = [
+    "7Np41oeYqPefeNQEHSv1UDhYrehxin3NStELsSKCT4K2",
+    "GdnSyH3YtwcxFvQrVVJMm1JhTS4QVX7MFsX56uJLUfiZ",
+]
+[gossip.bind]
+gossip = "0.0.0.0:8001"                          # --gossip-port
+[gossip.xdp]
+tx = ["eth0:2"]                                  # deliberately shares queue 2 with repair
+
+[tpu]
+max_ingest_tps = 1_000_000
+[tpu.bind]
+transactions = "0.0.0.0:8005"
+votes = "0.0.0.0:8006"
+votes_quic = "0.0.0.0:8007"
+[tpu.xdp]
+tx = ["eth0:3"]
+
+[rpc]
+threads = 4                                      # --rpc-threads
+blocking_threads = 1                             # --rpc-blocking-threads
+private = true                                   # --private-rpc
+only_known = true                                # --only-known-rpc
+[rpc.bind]
+json = "0.0.0.0:8899"                            # --rpc-port
+
+[accountsdb]
+snapshots_dir = "/home/sol/ledger-snapshots"     # --snapshots
+
+[ledger]
+path = "/home/sol/ledger"                        # --ledger
+wal_recovery_mode = "skip_any_corrupted_record"  # --wal-recovery-mode
+limit_size = true                                # --limit-ledger-size
+
+[log]
+path = "/home/sol/logs/agave-validator.log"      # --log
+
+[startup]
+identity_keypair = "/home/sol/identity/id.json"        # --identity
+vote_account_keypair = "/home/sol/identity/vote.json"  # --vote-account
+genesis_fetch = false                                  # --no-genesis-fetch
+snapshot_fetch = false                                 # --no-snapshot-fetch
+genesis_hash = "5eykt4UsFv8P8NJdTREpY1vzqKqZKvdpKuc147dw2N9d"  # --expected-genesis-hash
+shred_version = 50093                                  # --expected-shred-version

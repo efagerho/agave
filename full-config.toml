@@ -1,0 +1,284 @@
+# #############################################################################
+# 1. System-level configuration + memory allocator
+# #############################################################################
+
+# CPU housekeeping. Assumes a 2-socket box: NUMA nodes 0/1, 32 phys cores each
+# (logical 0-31 node 0, 32-63 node 1), SMT siblings 64-95 / 96-127.
+[system]
+unallocated_cpus  = "0-1"                       # left for OS/IRQs; off-limits to managed work
+confine_unmanaged = true                        # pin stray threads (tokio blocking pool, jemalloc purge) here
+denied_cpus       = "64-127"                     # idle the SMT siblings; auto-placement won't use them
+
+[jemalloc]
+background_thread      = true
+max_background_threads = 2
+percpu_arena           = "off"
+dirty_decay_ms         = 5000
+muzzy_decay_ms         = 0
+conf_extra             = "metadata_thp:auto"
+
+[jemalloc.profiles.replay]
+membind        = "node"
+dirty_decay_ms = 1000
+tcache         = true
+
+[jemalloc.profiles.accountsdb]
+membind        = "interleave"
+dirty_decay_ms = 10000
+muzzy_decay_ms = 0
+tcache         = true
+
+[jemalloc.profiles.turbine]
+membind        = "node"
+dirty_decay_ms = 500
+tcache         = true
+
+[jemalloc.profiles.tpu]
+membind        = "node"
+dirty_decay_ms = 250
+tcache         = false
+
+[jemalloc.profiles.gossip]
+membind        = "node"
+dirty_decay_ms = 2000
+
+# #############################################################################
+# 2. Network interface configuration
+# #############################################################################
+
+[network]
+dynamic_port_range = "8010-8030"                # --dynamic-port-range
+bind_addresses     = ["10.0.0.5", "10.0.1.5"]   # --bind-address (repeatable); sockets bind on each
+
+# Multihomed: one NIC per NUMA node, each with its own queue->CPU worker set.
+[interfaces."eth0"]                              # 10.0.0.5, node 0
+zero_copy            = true                      # --xdp-zero-copy
+placement            = "pinned_reserved"         # XDP worker CPUs are owned (pinned per queue)
+queue_to_cpu_mapping = ["0:8", "1:9", "2:10", "3:11"]
+
+[interfaces."eth1"]                              # 10.0.1.5, node 1
+zero_copy            = true
+placement            = "pinned_reserved"
+queue_to_cpu_mapping = ["0:40", "1:41", "2:42", "3:43"]
+
+# #############################################################################
+# 3. Modules (behavior + bind + xdp; thread pools are in section 4)
+# #############################################################################
+
+[turbine.xdp]
+tx = ["eth0:0", "eth0:1", "eth1:0", "eth1:1"]
+
+[repair.bind]
+serve_repair    = 8003
+ancestor_hashes = 8004
+
+[repair.xdp]
+tx = ["eth0:2"]
+
+[gossip]
+entrypoints = [
+    "entrypoint.mainnet-beta.solana.com:8001",
+    "entrypoint2.mainnet-beta.solana.com:8001",
+]
+known_validators = [
+    "7Np41oeYqPefeNQEHSv1UDhYrehxin3NStELsSKCT4K2",
+    "GdnSyH3YtwcxFvQrVVJMm1JhTS4QVX7MFsX56uJLUfiZ",
+]
+
+[gossip.bind]
+gossip = 8001
+
+[gossip.xdp]
+tx = ["eth0:2"]                                  # deliberately shares queue 2 with repair
+
+[tpu]
+max_ingest_tps = 1_000_000
+
+[tpu.bind]
+transactions = 8005
+votes        = 8006
+votes_quic   = 8007
+
+[tpu.xdp]
+tx = ["eth0:3", "eth1:3"]                        # forwarding egress on both NICs
+
+[rpc]
+threads          = 4                             # --rpc-threads
+blocking_threads = 1                             # --rpc-blocking-threads
+private          = true                          # --private-rpc
+only_known       = true                          # --only-known-rpc
+
+[rpc.bind]
+addresses = ["127.0.0.1"]                        # --rpc-bind-address; opts out of multihoming (private)
+json      = 8899                                 # --rpc-port
+pubsub    = 8900                                 # rpc-port + 1
+
+[accountsdb]
+snapshots_dir = "/home/sol/ledger-snapshots"     # --snapshots
+
+[ledger]
+path              = "/home/sol/ledger"                       # --ledger
+wal_recovery_mode = "skip_any_corrupted_record"             # --wal-recovery-mode
+limit_size        = true                                    # --limit-ledger-size
+
+[log]
+path = "/home/sol/logs/agave-validator.log"                 # --log
+
+[startup]
+identity_keypair     = "/home/sol/identity/id.json"         # --identity
+vote_account_keypair = "/home/sol/identity/vote.json"       # --vote-account
+genesis_fetch        = false                                # --no-genesis-fetch
+snapshot_fetch       = false                                # --no-snapshot-fetch
+genesis_hash         = "5eykt4UsFv8P8NJdTREpY1vzqKqZKvdpKuc147dw2N9d"  # --expected-genesis-hash
+shred_version        = 50093                                # --expected-shred-version
+
+# #############################################################################
+# 4. Thread pools, single threads & runtimes
+#
+# Thread pools, single threads, and runtimes are the CPU claimants managed
+# here, in one flat namespace alongside the [interfaces] and [jemalloc.profiles]
+# top-level registries. All express placement the same way (the `placement`
+# key + node scope).
+#
+# The XDP TX workers are CPU claimants too, but their placement lives on
+# [interfaces."<nic>"] in section 2 (it is tied to that NIC's queue->CPU
+# mapping) — so the full reserved-CPU picture spans this section and that block.
+# The OS thread name is derived from the identifier; `arena` references a
+# [jemalloc.profiles.*] profile.
+#
+# `threads`/`worker_threads = N` is an exact count; = "fill" sizes to the scope
+# (one worker per available CPU). Always spelled explicitly — never omitted.
+#
+# placement: "shared"          = shared mask over the scope, not reserved (default)
+#            "shared_reserved" = shared mask, capacity reserved so it isn't oversubscribed (unpinned)
+#            "pinned"          = each worker pinned 1:1 to a CPU, not reserved
+#            "pinned_reserved" = each worker pinned 1:1, cores reserved (owned)
+# #############################################################################
+
+[defaults.threadpools]
+placement = "shared_reserved"
+niceness  = 0
+
+[defaults.runtimes]
+placement = "shared_reserved"                    # tokio runtimes get budgeted capacity too
+niceness  = 0
+
+[threads.poh]
+cpus      = "2"                                  # --poh-pinned-cpu-core
+placement = "pinned_reserved"
+niceness  = -10                                  # needs CAP_SYS_NICE
+
+[threadpools.tvu_retransmit]
+threads = 8                                      # --tvu-retransmit-threads
+nodes   = "0"
+arena   = "turbine"
+
+[threadpools.tvu_receive]
+threads = 4                                      # --tvu-receive-threads
+nodes   = "0"
+arena   = "turbine"
+
+[threadpools.tvu_sigverify]
+threads   = 8                                    # --tvu-sigverify-threads
+nodes     = "0"
+placement = "pinned_reserved"                    # overrides the shared_reserved default
+arena     = "turbine"
+
+[threadpools.tvu_bls_sigverify]
+threads = 4                                      # --tvu-bls-sigverify-threads
+nodes   = "0"
+arena   = "turbine"
+
+[threadpools.gossip]
+threads = 4
+nodes   = "0"
+arena   = "gossip"
+
+[threadpools.tpu_sigverify]
+threads   = 8                                    # --tpu-sigverify-threads
+nodes     = "0-1"
+placement = "pinned_reserved"
+arena     = "tpu"
+
+[threadpools.tpu_transaction_receive]
+threads = 4                                      # --tpu-transaction-receive-threads
+nodes   = "1"
+arena   = "tpu"
+
+[threadpools.tpu_vote_receive]
+threads = 2                                      # --tpu-vote-transaction-receive-threads
+nodes   = "1"
+arena   = "tpu"
+
+[threadpools.tpu_forward_receive]
+threads = 2                                      # --tpu-transaction-forward-receive-threads
+nodes   = "1"
+arena   = "tpu"
+
+[threadpools.replay_transactions]
+threads = 32                                     # --replay-transactions-threads
+nodes   = "0-1"
+arena   = "replay"
+
+[threadpools.replay_forks]
+threads = 4                                      # --replay-forks-threads
+nodes   = "0"
+arena   = "replay"
+
+[threadpools.accounts_foreground]
+threads = 8                                      # --accounts-db-foreground-threads
+nodes   = "0-1"
+arena   = "accountsdb"
+
+[threadpools.accounts_background]
+threads = 6                                      # --accounts-db-background-threads
+nodes   = "0-1"
+arena   = "accountsdb"
+
+[threadpools.accounts_index_flush]
+threads = 4                                      # --accounts-index-flush-threads
+nodes   = "0-1"
+arena   = "accountsdb"
+
+[threadpools.accounts_hash]
+threads   = 4
+nodes     = "0"
+placement = "pinned"                             # 1:1 pinned but not reserved
+arena     = "accountsdb"
+
+[threadpools.snapshot]
+threads   = "fill"                               # one worker per free cpu on node 0
+nodes     = "0"
+placement = "shared"
+niceness  = 10
+
+[threadpools.rayon_global]
+threads = 32                                     # --rayon-threads
+nodes   = "0-1"
+
+[runtimes.tpu_quic]
+kind           = "multi_thread"
+worker_threads = "fill"
+nodes          = "1"
+
+[runtimes.rpc_service]
+kind                 = "multi_thread"
+worker_threads       = 16
+max_blocking_threads = 32
+enable_io            = true
+enable_time          = true
+thread_stack_size    = 2097152
+nodes                = "0"
+
+[runtimes.rpc_pubsub]
+kind           = "multi_thread"
+worker_threads = "fill"
+nodes          = "0"
+enable_io      = false
+enable_time    = false
+
+[runtimes.metrics]
+kind      = "current_thread"
+cpus      = "12"
+placement = "shared"
+niceness  = 5
