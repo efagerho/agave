@@ -54,26 +54,26 @@ bind_addresses     = ["10.0.0.5", "10.0.1.5"]   # --bind-address (repeatable); s
 [interfaces."eth0"]                              # 10.0.0.5, node 0
 zero_copy            = true                      # --xdp-zero-copy
 placement            = "pinned_reserved"         # XDP worker CPUs are owned (pinned per queue)
-queue_to_cpu_mapping = ["0:8", "1:9", "2:10", "3:11"]
+queue_to_cpu_mapping = { 0 = 8, 1 = 9, 2 = 10, 3 = 11 }
 
 [interfaces."eth1"]                              # 10.0.1.5, node 1
 zero_copy            = true
 placement            = "pinned_reserved"
-queue_to_cpu_mapping = ["0:40", "1:41", "2:42", "3:43"]
+queue_to_cpu_mapping = { 0 = 40, 1 = 41, 2 = 42, 3 = 43 }
 
 # #############################################################################
 # 3. Modules (behavior + bind + xdp; thread pools are in section 4)
 # #############################################################################
 
 [turbine.xdp]
-tx = ["eth0:0", "eth0:1", "eth1:0", "eth1:1"]
+tx = { eth0 = [0, 1], eth1 = [0, 1] }
 
 [repair.bind]
 serve_repair    = 8003
 ancestor_hashes = 8004
 
 [repair.xdp]
-tx = ["eth0:2"]
+tx = { eth0 = [2] }
 
 [gossip]
 entrypoints = [
@@ -89,7 +89,7 @@ known_validators = [
 gossip = 8001
 
 [gossip.xdp]
-tx = ["eth0:2"]                                  # deliberately shares queue 2 with repair
+tx = { eth0 = [2] }                              # deliberately shares queue 2 with repair
 
 [tpu]
 max_ingest_tps = 1_000_000
@@ -100,7 +100,7 @@ votes        = 8006
 votes_quic   = 8007
 
 [tpu.xdp]
-tx = ["eth0:3", "eth1:3"]                        # forwarding egress on both NICs
+tx = { eth0 = [3], eth1 = [3] }                  # forwarding egress on both NICs
 
 [rpc]
 threads          = 4                             # --rpc-threads
