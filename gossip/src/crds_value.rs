@@ -16,6 +16,7 @@ use {
     solana_signer::Signer,
     std::{
         borrow::{Borrow, Cow},
+        cell::RefCell,
         mem::MaybeUninit,
     },
     wincode::{ReadError, ReadResult, SchemaRead, SchemaWrite, config::Config, io::Reader},
@@ -117,22 +118,28 @@ impl CrdsValue {
             return true;
         }
         let pubkey = self.pubkey();
-        let signable_data = self.signable_data();
-        let message = signable_data.borrow();
         let sig_bytes: [u8; 64] = self.signature.into();
         let signature = ed25519_dalek::Signature::from_bytes(&sig_bytes);
-        let verified = match cache.verifying_keys.get(&pubkey) {
-            Some(vk) => vk.verify_strict(message, &signature).is_ok(),
-            None => {
-                let Ok(vk) = ed25519_dalek::VerifyingKey::try_from(pubkey.as_ref()) else {
-                    return false;
-                };
-                if vk.verify_strict(message, &signature).is_err() {
-                    return false;
+        // Not Signable::signable_data: its Cow<'static> forces a heap
+        // allocation per value.
+        let verified = with_serialized_data(&self.data, |message| {
+            match cache.verifying_keys.get(&pubkey) {
+                Some(vk) => vk.verify_strict(message, &signature).is_ok(),
+                None => {
+                    let Ok(vk) = ed25519_dalek::VerifyingKey::try_from(pubkey.as_ref()) else {
+                        return false;
+                    };
+                    if vk.verify_strict(message, &signature).is_err() {
+                        return false;
+                    }
+                    cache.verifying_keys.insert(pubkey, vk);
+                    true
                 }
-                cache.verifying_keys.insert(pubkey, vk);
-                true
             }
+        });
+        // Too large to serialize means it never arrived in a packet.
+        let Ok(verified) = verified else {
+            return false;
         };
         if verified {
             cache.verified_values.insert(self.hash);
@@ -252,6 +259,27 @@ impl CrdsValue {
 // sha256(signature || serialized_data), for callers that already serialized.
 fn hash_signed_data(signature: &Signature, serialized_data: &[u8]) -> Hash {
     solana_sha256_hasher::hashv(&[signature.as_ref(), serialized_data])
+}
+
+// Serializes `data` into a reusable per-thread buffer and invokes `f` on it.
+// PACKET_DATA_SIZE is always enough since the value originated in a packet.
+//
+// Not the stack buffer compute_crds_value_hash uses: `f` wraps ed25519
+// verification, so a PACKET_DATA_SIZE array would stay live across it and cost
+// ~5% IPC on the verify path, more than the allocation it saves.
+fn with_serialized_data<R>(data: &CrdsData, f: impl FnOnce(&[u8]) -> R) -> wincode::WriteResult<R> {
+    thread_local! {
+        static BUFFER: RefCell<Vec<u8>> = RefCell::new(vec![0u8; PACKET_DATA_SIZE]);
+    }
+    // Not re-entrant; `f` never serializes a CrdsData.
+    BUFFER.with_borrow_mut(|buffer| {
+        let written = {
+            let mut writer: &mut [u8] = buffer;
+            wincode::serialize_into(&mut writer, data)?;
+            PACKET_DATA_SIZE - writer.len()
+        };
+        Ok(f(&buffer[..written]))
+    })
 }
 
 // Computes sha256(signature || serialize(data)) using a stack buffer.
