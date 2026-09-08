@@ -61,6 +61,7 @@ pub const CRDS_GOSSIP_PURGE_DURATION: Duration = Duration::from_secs(2 * 24 * 60
 const FAILED_INSERTS_RETENTION_MS: u64 = 20_000;
 const PURGE_BATCH_SIZE: usize = 32;
 const PULL_RESPONSE_FILTER_BATCH_SIZE: usize = 32;
+const PULL_RESPONSE_INSERT_BATCH_SIZE: usize = 32;
 pub const FALSE_RATE: f64 = 0.1f64;
 pub const KEYS: f64 = 8f64;
 
@@ -473,25 +474,38 @@ impl CrdsGossipPull {
         now: u64,
         stats: &mut ProcessPullStats,
     ) {
-        let mut owners = HashSet::new();
-        let mut crds = crds.write();
-        for response in responses_expired_timeout {
-            let _ = crds.insert(response, now, GossipRoute::PullResponse);
-        }
+        // Preserve the legacy order (expired responses first), while bounding
+        // the insertion work performed under one write guard.
+        let mut pending = responses_expired_timeout
+            .into_iter()
+            .map(|response| (false, response))
+            .chain(responses.into_iter().map(|response| (true, response)));
+        let mut batch = Vec::with_capacity(PULL_RESPONSE_INSERT_BATCH_SIZE);
+        let mut owners = HashSet::with_capacity(PULL_RESPONSE_INSERT_BATCH_SIZE);
         let mut num_inserts = 0;
-        for response in responses {
-            let owner = response.pubkey();
-            if let Ok(()) = crds.insert(response, now, GossipRoute::PullResponse) {
-                num_inserts += 1;
-                owners.insert(owner);
+        loop {
+            batch.extend(pending.by_ref().take(PULL_RESPONSE_INSERT_BATCH_SIZE));
+            if batch.is_empty() {
+                break;
+            }
+            let mut crds = crds.write();
+            for (update_owner_timestamp, response) in batch.drain(..) {
+                let owner = response.pubkey();
+                if let Ok(()) = crds.insert(response, now, GossipRoute::PullResponse)
+                    && update_owner_timestamp
+                {
+                    num_inserts += 1;
+                    owners.insert(owner);
+                }
+            }
+            // Refresh once per owner under the insertion guard so purge cannot
+            // interleave between inserting the value and refreshing its record.
+            for owner in owners.drain() {
+                crds.update_record_timestamp(&owner, now);
             }
         }
         stats.success += num_inserts;
         self.num_pulls.fetch_add(num_inserts, Ordering::Relaxed);
-        for owner in owners {
-            crds.update_record_timestamp(&owner, now);
-        }
-        drop(crds);
         stats.failed_insert += failed_inserts.len();
         self.purge_failed_inserts(now);
         let failed_inserts = failed_inserts.into_iter().zip(repeat(now));
@@ -1335,6 +1349,66 @@ pub(crate) mod tests {
         let entry: &VersionedCrdsValue = node_crds.get(&new.label()).unwrap();
         assert_eq!(entry.value, new);
         assert_eq!(entry.local_timestamp, 1);
+    }
+
+    #[test]
+    fn test_process_pull_responses_refreshes_owner_contact_info() {
+        let owner = Pubkey::new_unique();
+        let contact_info =
+            CrdsValue::new_unsigned(CrdsData::from(ContactInfo::new_localhost(&owner, 0)));
+        let response =
+            CrdsValue::new_unsigned(CrdsData::LowestSlot(0, LowestSlot::new(owner, 0, 1)));
+        let mut crds = Crds::default();
+        crds.insert(contact_info, 0, GossipRoute::LocalMessage)
+            .unwrap();
+        let crds = parking_lot::RwLock::new(crds);
+        let pull = CrdsGossipPull::default();
+        let mut stats = ProcessPullStats::default();
+
+        pull.process_pull_responses(&crds, vec![response], vec![], vec![], 1, &mut stats);
+
+        let crds = crds.read();
+        let contact_info: &VersionedCrdsValue = crds
+            .get(&crate::crds_value::CrdsValueLabel::ContactInfo(owner))
+            .unwrap();
+        assert_eq!(contact_info.local_timestamp, 1);
+        assert_eq!(stats.success, 1);
+    }
+
+    #[test]
+    fn test_process_pull_responses_refreshes_owner_without_contact_info() {
+        let owner = Pubkey::new_unique();
+        let crds = parking_lot::RwLock::default();
+        let old = CrdsValue::new_unsigned(CrdsData::LowestSlot(0, LowestSlot::new(owner, 0, 0)));
+        crds.write()
+            .unwrap()
+            .insert(old, 0, GossipRoute::LocalMessage)
+            .unwrap();
+        let responses: Vec<_> = (0..2 * PULL_RESPONSE_INSERT_BATCH_SIZE + 1)
+            .map(|index| {
+                CrdsValue::new_unsigned(CrdsData::EpochSlots(
+                    index as u8,
+                    crate::epoch_slots::EpochSlots::new(owner, 1),
+                ))
+            })
+            .collect();
+        let mut stats = ProcessPullStats::default();
+        CrdsGossipPull::default().process_pull_responses(
+            &crds,
+            responses.clone(),
+            vec![],
+            vec![],
+            2,
+            &mut stats,
+        );
+        assert_eq!(stats.success, responses.len());
+        let crds = crds.read();
+        assert!(crds.get::<&ContactInfo>(owner).is_none());
+        assert_eq!(crds.len(), responses.len() + 1);
+        assert!(
+            crds.get_records(&owner)
+                .all(|entry| entry.local_timestamp == 2)
+        );
     }
 
     #[test]
