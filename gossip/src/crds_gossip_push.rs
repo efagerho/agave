@@ -52,6 +52,7 @@ const CRDS_GOSSIP_PRUNE_MSG_TIMEOUT_MS: u64 = 500;
 const CRDS_GOSSIP_PRUNE_STAKE_THRESHOLD_PCT: f64 = 0.15;
 const CRDS_GOSSIP_PRUNE_MIN_INGRESS_NODES: usize = 2;
 const CRDS_GOSSIP_PUSH_ACTIVE_SET_SIZE: usize = CRDS_GOSSIP_PUSH_FANOUT + 3;
+const CRDS_GOSSIP_PUSH_INSERT_BATCH_SIZE: usize = 16;
 
 pub struct CrdsGossipPush {
     /// Active set of validators for push
@@ -138,24 +139,26 @@ impl CrdsGossipPush {
         }
 
         let num_values = messages.iter().map(|(_, values)| values.len()).sum();
-        let mut pending: Vec<_> = messages
-            .into_iter()
-            .flat_map(|(from, values)| {
-                values.into_iter().map(move |value| {
-                    let origin = value.pubkey();
-                    let sampled_signature = should_report_message_signature(
-                        value.signature(),
-                        SIGNATURE_SAMPLE_LEADING_ZEROS,
-                    )
-                    .then(|| *value.signature());
-                    (origin, from, sampled_signature, value)
-                })
+        let mut pending = messages.into_iter().flat_map(|(from, values)| {
+            values.into_iter().map(move |value| {
+                let origin = value.pubkey();
+                let sampled_signature = should_report_message_signature(
+                    value.signature(),
+                    SIGNATURE_SAMPLE_LEADING_ZEROS,
+                )
+                .then(|| *value.signature());
+                (origin, from, sampled_signature, value)
             })
-            .collect();
+        });
         let mut insert_results = Vec::with_capacity(num_values);
-        {
+        let mut batch = Vec::with_capacity(CRDS_GOSSIP_PUSH_INSERT_BATCH_SIZE);
+        loop {
+            batch.extend(pending.by_ref().take(CRDS_GOSSIP_PUSH_INSERT_BATCH_SIZE));
+            if batch.is_empty() {
+                break;
+            }
             let mut crds = crds.write();
-            for (origin, from, sampled_signature, value) in pending.drain(..) {
+            for (origin, from, sampled_signature, value) in batch.drain(..) {
                 let result = crds.insert(value, now, GossipRoute::PushMessage(&from));
                 insert_results.push((origin, from, sampled_signature, result));
             }
