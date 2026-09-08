@@ -742,3 +742,28 @@ pub(crate) fn log_gossip_crds_sample_egress(value: &CrdsValue, peer: &Pubkey) {
         ),
     );
 }
+
+pub(crate) fn log_gossip_crds_sample_ingress(
+    origin: &Pubkey,
+    signature: &Signature,
+    from: &Pubkey,
+) {
+    datapoint_info!(
+        "gossip_crds_sample",
+        (
+            "origin",
+            last_four_chars(&origin.to_string()),
+            Option<String>
+        ),
+        (
+            "signature",
+            last_four_chars(&signature.to_string()),
+            Option<String>
+        ),
+        (
+            "from",
+            last_four_chars(&from.to_string()),
+            Option<String>
+        ),
+    );
+}

@@ -27,7 +27,6 @@
 
 use {
     crate::{
-        cluster_info_metrics::{last_four_chars, should_report_message_signature},
         contact_info::{ContactInfo, Protocol},
         contact_info_notifier::{ContactInfoEvent, ContactInfoSender, ContactInfoSnapshot},
         crds_data::CrdsData,
@@ -1061,38 +1060,13 @@ impl Default for CrdsDataStats {
 }
 
 impl CrdsDataStats {
-    fn record_insert(&mut self, entry: &VersionedCrdsValue, route: GossipRoute) {
+    fn record_insert(&mut self, entry: &VersionedCrdsValue) {
         self.counts[Self::ordinal(entry)] += 1;
         if let CrdsData::Vote(_, vote) = entry.value.data()
             && let Some(slot) = vote.slot()
         {
             let num_nodes = self.votes.get(&slot).copied().unwrap_or_default();
             self.votes.put(slot, num_nodes + 1);
-        }
-        let GossipRoute::PushMessage(from) = route else {
-            return;
-        };
-
-        if should_report_message_signature(entry.value.signature(), SIGNATURE_SAMPLE_LEADING_ZEROS)
-        {
-            datapoint_info!(
-                "gossip_crds_sample",
-                (
-                    "origin",
-                    last_four_chars(&entry.value.pubkey().to_string()),
-                    Option<String>
-                ),
-                (
-                    "signature",
-                    last_four_chars(&entry.value.signature().to_string()),
-                    Option<String>
-                ),
-                (
-                    "from",
-                    last_four_chars(&from.to_string()),
-                    Option<String>
-                )
-            );
         }
     }
 
@@ -1126,8 +1100,8 @@ impl CrdsStats {
         match route {
             GossipRoute::LocalMessage => (),
             GossipRoute::PullRequest => (),
-            GossipRoute::PushMessage(_) => self.push.record_insert(entry, route),
-            GossipRoute::PullResponse => self.pull.record_insert(entry, route),
+            GossipRoute::PushMessage(_) => self.push.record_insert(entry),
+            GossipRoute::PullResponse => self.pull.record_insert(entry),
         }
     }
 

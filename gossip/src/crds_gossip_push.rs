@@ -14,7 +14,10 @@
 use {
     crate::{
         cluster_info::CRDS_UNIQUE_PUBKEY_CAPACITY,
-        cluster_info_metrics::{log_gossip_crds_sample_egress, should_report_message_signature},
+        cluster_info_metrics::{
+            log_gossip_crds_sample_egress, log_gossip_crds_sample_ingress,
+            should_report_message_signature,
+        },
         crds::{Crds, CrdsError, Cursor, GossipRoute, SIGNATURE_SAMPLE_LEADING_ZEROS},
         crds_gossip,
         crds_value::CrdsValue,
@@ -124,35 +127,65 @@ impl CrdsGossipPush {
     pub(crate) fn process_push_message(
         &self,
         crds: &parking_lot::RwLock<Crds>,
-        messages: Vec<(/*from:*/ Pubkey, Vec<CrdsValue>)>,
+        mut messages: Vec<(/*from:*/ Pubkey, Vec<CrdsValue>)>,
         now: u64,
     ) -> HashSet<Pubkey> {
-        let mut received_cache = self.received_cache.lock().unwrap();
-        let mut crds = crds.write();
         let wallclock_window = self.wallclock_window(now);
-        let mut origins = HashSet::new();
-        for (from, values) in messages {
-            self.num_total.fetch_add(values.len(), Ordering::Relaxed);
-            for value in values {
-                if !wallclock_window.contains(&value.wallclock()) {
-                    continue;
+        let num_total = messages.iter().map(|(_, values)| values.len()).sum();
+        self.num_total.fetch_add(num_total, Ordering::Relaxed);
+        for (_, values) in &mut messages {
+            values.retain(|value| wallclock_window.contains(&value.wallclock()));
+        }
+
+        let num_values = messages.iter().map(|(_, values)| values.len()).sum();
+        let mut pending: Vec<_> = messages
+            .into_iter()
+            .flat_map(|(from, values)| {
+                values.into_iter().map(move |value| {
+                    let origin = value.pubkey();
+                    let sampled_signature = should_report_message_signature(
+                        value.signature(),
+                        SIGNATURE_SAMPLE_LEADING_ZEROS,
+                    )
+                    .then(|| *value.signature());
+                    (origin, from, sampled_signature, value)
+                })
+            })
+            .collect();
+        let mut insert_results = Vec::with_capacity(num_values);
+        {
+            let mut crds = crds.write();
+            for (origin, from, sampled_signature, value) in pending.drain(..) {
+                let result = crds.insert(value, now, GossipRoute::PushMessage(&from));
+                insert_results.push((origin, from, sampled_signature, result));
+            }
+        }
+
+        let mut received_cache = self.received_cache.lock().unwrap();
+        let mut origins = HashSet::with_capacity(insert_results.len());
+        let mut num_old = 0;
+        for (origin, from, sampled_signature, result) in insert_results {
+            match result {
+                Ok(()) => {
+                    if let Some(signature) = sampled_signature {
+                        log_gossip_crds_sample_ingress(&origin, &signature, &from);
+                    }
+                    received_cache.record(origin, from, /*num_dups:*/ 0);
+                    origins.insert(origin);
                 }
-                let origin = value.pubkey();
-                match crds.insert(value, now, GossipRoute::PushMessage(&from)) {
-                    Ok(()) => {
-                        received_cache.record(origin, from, /*num_dups:*/ 0);
-                        origins.insert(origin);
-                    }
-                    Err(CrdsError::DuplicatePush(num_dups)) => {
-                        received_cache.record(origin, from, usize::from(num_dups));
-                        self.num_old.fetch_add(1, Ordering::Relaxed);
-                    }
-                    Err(CrdsError::InsertFailed) => {
-                        received_cache.record(origin, from, /*num_dups:*/ usize::MAX);
-                        self.num_old.fetch_add(1, Ordering::Relaxed);
-                    }
+                Err(CrdsError::DuplicatePush(num_dups)) => {
+                    received_cache.record(origin, from, usize::from(num_dups));
+                    num_old += 1;
+                }
+                Err(CrdsError::InsertFailed) => {
+                    received_cache.record(origin, from, /*num_dups:*/ usize::MAX);
+                    num_old += 1;
                 }
             }
+        }
+        drop(received_cache);
+        if num_old != 0 {
+            self.num_old.fetch_add(num_old, Ordering::Relaxed);
         }
         origins
     }
@@ -181,6 +214,7 @@ impl CrdsGossipPush {
         let mut num_pushes = 0;
         let mut values = Vec::new();
         let mut push_messages = HashMap::<Pubkey, Vec</*index:*/ usize>>::new();
+        let mut sampled_egress = Vec::new();
         let wallclock_window = self.wallclock_window(now);
         let active_set = self.active_set.read().unwrap();
         let mut crds_cursor = self.crds_cursor.lock().unwrap();
@@ -205,7 +239,7 @@ impl CrdsGossipPush {
                 should_report_message_signature(value.signature(), SIGNATURE_SAMPLE_LEADING_ZEROS);
             for &node in nodes {
                 if should_report {
-                    log_gossip_crds_sample_egress(value, &node);
+                    sampled_egress.push((index, node));
                 }
                 push_messages.entry(node).or_default().push(index);
                 num_pushes += 1;
@@ -217,6 +251,9 @@ impl CrdsGossipPush {
         drop(crds);
         drop(crds_cursor);
         drop(active_set);
+        for (index, peer) in sampled_egress {
+            log_gossip_crds_sample_egress(&values[index], &peer);
+        }
         self.num_pushes.fetch_add(num_pushes, Ordering::Relaxed);
         (values, push_messages, num_pushes)
     }
