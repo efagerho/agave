@@ -143,6 +143,7 @@ fn pull_request_scan_cost(scan_entries: usize, bloom_hash_count: usize) -> u64 {
 
 pub const DEFAULT_CONTACT_DEBUG_INTERVAL_MILLIS: u64 = 10_000;
 pub const DEFAULT_CONTACT_SAVE_INTERVAL_MILLIS: u64 = 60_000;
+const CONTACT_INFO_SNAPSHOT_BATCH_SIZE: usize = 64;
 // Limit number of unique pubkeys in the crds table.
 pub(crate) const CRDS_UNIQUE_PUBKEY_CAPACITY: usize = 8192;
 
@@ -356,40 +357,56 @@ impl ClusterInfo {
         self.gossip.crds.write().set_contact_info_sender(sender);
     }
 
+    fn save_contact_info_pubkeys(&self) -> Vec<Pubkey> {
+        let gossip_crds = self.gossip.crds.read();
+        gossip_crds
+            .get_nodes_contact_info()
+            .map(|node| *node.pubkey())
+            .collect()
+    }
+
+    fn save_contact_info_batch(
+        &self,
+        pubkeys: &[Pubkey],
+        self_pubkey: &Pubkey,
+        entrypoint_gossip_addrs: &HashSet<SocketAddr>,
+        out: &mut Vec<CrdsValue>,
+    ) {
+        debug_assert!(out.capacity() - out.len() >= pubkeys.len());
+        let gossip_crds = self.gossip.crds.read();
+        out.extend(pubkeys.iter().filter_map(|pubkey| {
+            let label = CrdsValueLabel::ContactInfo(*pubkey);
+            let value = gossip_crds.get::<&CrdsValue>(&label)?;
+            let contact_info = value.contact_info().unwrap();
+            (contact_info.pubkey() != self_pubkey
+                && contact_info
+                    .gossip()
+                    .map(|addr| !entrypoint_gossip_addrs.contains(&addr))
+                    .unwrap_or_default())
+            .then(|| value.clone())
+        }));
+    }
+
     pub fn save_contact_info(&self) {
         let _st = ScopedTimer::from(&self.stats.save_contact_info_time);
-        let nodes = {
-            let entrypoint_gossip_addrs = self
-                .entrypoints
-                .read()
-                .unwrap()
-                .iter()
-                .filter_map(ContactInfo::gossip)
-                .collect::<HashSet<_>>();
-            let self_pubkey = self.id();
-            let gossip_crds = self.gossip.crds.read();
-            gossip_crds
-                .get_nodes()
-                .filter_map(|v| {
-                    // Don't save:
-                    // 1. Our ContactInfo. No point
-                    // 2. Entrypoint ContactInfo. This will avoid adopting the incorrect shred
-                    //    version on restart if the entrypoint shred version changes.  Also
-                    //    there's not much point in saving entrypoint ContactInfo since by
-                    //    definition that information is already available
-                    let contact_info = v.value.contact_info().unwrap();
-                    if contact_info.pubkey() != &self_pubkey
-                        && contact_info
-                            .gossip()
-                            .map(|addr| !entrypoint_gossip_addrs.contains(&addr))
-                            .unwrap_or_default()
-                    {
-                        return Some(v.value.clone());
-                    }
-                    None
-                })
-                .collect::<Vec<_>>()
-        };
+        let entrypoint_gossip_addrs = self
+            .entrypoints
+            .read()
+            .unwrap()
+            .iter()
+            .filter_map(ContactInfo::gossip)
+            .collect::<HashSet<_>>();
+        let self_pubkey = self.id();
+        let pubkeys = self.save_contact_info_pubkeys();
+        let mut nodes = Vec::with_capacity(pubkeys.len());
+        for pubkeys in pubkeys.chunks(CONTACT_INFO_SNAPSHOT_BATCH_SIZE) {
+            self.save_contact_info_batch(
+                pubkeys,
+                &self_pubkey,
+                &entrypoint_gossip_addrs,
+                &mut nodes,
+            );
+        }
 
         if nodes.is_empty() {
             return;
