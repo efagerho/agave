@@ -620,11 +620,27 @@ impl Crds {
 
     /// Returns all vote entries inserted since the given cursor.
     /// Updates the cursor as the votes are consumed.
+    #[cfg(test)]
     pub(crate) fn get_votes<'a>(
         &'a self,
         cursor: &'a mut Cursor,
     ) -> impl Iterator<Item = &'a VersionedCrdsValue> {
         let range = (Bound::Included(cursor.ordinal()), Bound::Unbounded);
+        self.votes.range(range).map(move |(ordinal, index)| {
+            cursor.consume(*ordinal);
+            self.table.index(*index)
+        })
+    }
+
+    pub(crate) fn get_votes_until<'a>(
+        &'a self,
+        cursor: &'a mut Cursor,
+        end_ordinal: u64,
+    ) -> impl Iterator<Item = &'a VersionedCrdsValue> {
+        let range = (
+            Bound::Included(cursor.ordinal()),
+            Bound::Excluded(end_ordinal),
+        );
         self.votes.range(range).map(move |(ordinal, index)| {
             cursor.consume(*ordinal);
             self.table.index(*index)

@@ -145,6 +145,7 @@ pub const DEFAULT_CONTACT_DEBUG_INTERVAL_MILLIS: u64 = 10_000;
 pub const DEFAULT_CONTACT_SAVE_INTERVAL_MILLIS: u64 = 60_000;
 const CONTACT_INFO_SNAPSHOT_BATCH_SIZE: usize = 64;
 const EPOCH_SLOTS_SNAPSHOT_BATCH_SIZE: usize = 64;
+const VOTE_SNAPSHOT_BATCH_SIZE: usize = 64;
 // Limit number of unique pubkeys in the crds table.
 pub(crate) const CRDS_UNIQUE_PUBKEY_CAPACITY: usize = 8192;
 
@@ -1075,20 +1076,66 @@ impl ClusterInfo {
         }
     }
 
+    fn get_votes_batch(
+        &self,
+        cursor: &mut Cursor,
+        end_ordinal: Option<u64>,
+        out: &mut Vec<Transaction>,
+    ) -> u64 {
+        out.reserve(VOTE_SNAPSHOT_BATCH_SIZE);
+        let crds = self.time_gossip_read_lock("get_votes", &self.stats.get_votes);
+        let end_ordinal = end_ordinal.unwrap_or_else(|| crds.next_ordinal());
+        out.extend(
+            crds.get_votes_until(cursor, end_ordinal)
+                .take(VOTE_SNAPSHOT_BATCH_SIZE)
+                .map(|vote| {
+                    let CrdsData::Vote(_, vote) = vote.value.data() else {
+                        panic!("this should not happen!");
+                    };
+                    vote.transaction().clone()
+                }),
+        );
+        end_ordinal
+    }
+
     /// Returns votes inserted since the given cursor.
     pub fn get_votes(&self, cursor: &mut Cursor) -> Vec<Transaction> {
-        let txs: Vec<Transaction> = self
-            .time_gossip_read_lock("get_votes", &self.stats.get_votes)
-            .get_votes(cursor)
-            .map(|vote| {
-                let CrdsData::Vote(_, vote) = vote.value.data() else {
-                    panic!("this should not happen!");
-                };
-                vote.transaction().clone()
-            })
-            .collect();
+        let mut txs = Vec::new();
+        let mut end_ordinal = None;
+        loop {
+            let start = txs.len();
+            end_ordinal = Some(self.get_votes_batch(cursor, end_ordinal, &mut txs));
+            if txs.len() - start < VOTE_SNAPSHOT_BATCH_SIZE {
+                break;
+            }
+        }
         self.stats.get_votes_count.add_relaxed(txs.len() as u64);
         txs
+    }
+
+    fn get_votes_with_labels_batch(
+        &self,
+        cursor: &mut Cursor,
+        end_ordinal: Option<u64>,
+        labels: &mut Vec<CrdsValueLabel>,
+        votes: &mut Vec<Transaction>,
+    ) -> u64 {
+        labels.reserve(VOTE_SNAPSHOT_BATCH_SIZE);
+        votes.reserve(VOTE_SNAPSHOT_BATCH_SIZE);
+        let crds = self.time_gossip_read_lock("get_votes", &self.stats.get_votes);
+        let end_ordinal = end_ordinal.unwrap_or_else(|| crds.next_ordinal());
+        for vote in crds
+            .get_votes_until(cursor, end_ordinal)
+            .take(VOTE_SNAPSHOT_BATCH_SIZE)
+        {
+            let label = vote.value.label();
+            let CrdsData::Vote(_, vote) = vote.value.data() else {
+                panic!("this should not happen!");
+            };
+            labels.push(label);
+            votes.push(vote.transaction().clone());
+        }
+        end_ordinal
     }
 
     /// Returns votes and the associated labels inserted since the given cursor.
@@ -1096,17 +1143,17 @@ impl ClusterInfo {
         &self,
         cursor: &mut Cursor,
     ) -> (Vec<CrdsValueLabel>, Vec<Transaction>) {
-        let (labels, txs): (_, Vec<_>) = self
-            .time_gossip_read_lock("get_votes", &self.stats.get_votes)
-            .get_votes(cursor)
-            .map(|vote| {
-                let label = vote.value.label();
-                let CrdsData::Vote(_, vote) = vote.value.data() else {
-                    panic!("this should not happen!");
-                };
-                (label, vote.transaction().clone())
-            })
-            .unzip();
+        let mut labels = Vec::new();
+        let mut txs = Vec::new();
+        let mut end_ordinal = None;
+        loop {
+            let start = txs.len();
+            end_ordinal =
+                Some(self.get_votes_with_labels_batch(cursor, end_ordinal, &mut labels, &mut txs));
+            if txs.len() - start < VOTE_SNAPSHOT_BATCH_SIZE {
+                break;
+            }
+        }
         self.stats.get_votes_count.add_relaxed(txs.len() as u64);
         (labels, txs)
     }
@@ -3526,6 +3573,53 @@ mod tests {
         // make sure timestamp filter works
         let votes = cluster_info.get_votes(&mut cursor);
         assert_eq!(votes, vec![]);
+    }
+
+    #[test]
+    fn test_get_votes_batches_preserve_order_and_labels() {
+        let keypair = Arc::new(Keypair::new());
+        let contact_info = ContactInfo::new_localhost(&keypair.pubkey(), 0);
+        let cluster_info = ClusterInfo::new(contact_info, keypair, SocketAddrSpace::Unspecified);
+        let mut expected_labels = Vec::new();
+        let mut expected_votes = Vec::new();
+        for slot in 0..2 * VOTE_SNAPSHOT_BATCH_SIZE + 1 {
+            let keypair = Keypair::new();
+            let transaction = new_vote_transaction(vec![slot as Slot]);
+            expected_labels.push(CrdsValueLabel::Vote(0, keypair.pubkey()));
+            expected_votes.push(transaction.clone());
+            cluster_info.push_vote_at_index(transaction, 0, &keypair);
+        }
+
+        assert_eq!(
+            cluster_info.get_votes(&mut Cursor::default()),
+            expected_votes
+        );
+        assert_eq!(
+            cluster_info.get_votes_with_labels(&mut Cursor::default()),
+            (expected_labels, expected_votes.clone())
+        );
+
+        let mut cursor = Cursor::default();
+        let mut snapshot = Vec::new();
+        let snapshot_end = cluster_info.get_votes_batch(&mut cursor, None, &mut snapshot);
+        assert_eq!(snapshot.len(), VOTE_SNAPSHOT_BATCH_SIZE);
+        for slot in 0..VOTE_SNAPSHOT_BATCH_SIZE {
+            let keypair = Keypair::new();
+            let transaction = new_vote_transaction(vec![10_000 + slot as Slot]);
+            cluster_info.push_vote_at_index(transaction, 0, &keypair);
+        }
+        loop {
+            let start = snapshot.len();
+            cluster_info.get_votes_batch(&mut cursor, Some(snapshot_end), &mut snapshot);
+            if snapshot.len() - start < VOTE_SNAPSHOT_BATCH_SIZE {
+                break;
+            }
+        }
+        assert_eq!(snapshot, expected_votes);
+        assert_eq!(
+            cluster_info.get_votes(&mut cursor).len(),
+            VOTE_SNAPSHOT_BATCH_SIZE
+        );
     }
 
     fn new_vote_transaction(slots: Vec<Slot>) -> Transaction {
