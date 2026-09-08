@@ -52,6 +52,8 @@ const CRDS_GOSSIP_PRUNE_MSG_TIMEOUT_MS: u64 = 500;
 const CRDS_GOSSIP_PRUNE_STAKE_THRESHOLD_PCT: f64 = 0.15;
 const CRDS_GOSSIP_PRUNE_MIN_INGRESS_NODES: usize = 2;
 const CRDS_GOSSIP_PUSH_ACTIVE_SET_SIZE: usize = CRDS_GOSSIP_PUSH_FANOUT + 3;
+// Bound the amount of CRDS mutation performed while continuously excluding
+// readers. Large push packets are applied in multiple critical sections.
 const CRDS_GOSSIP_PUSH_INSERT_BATCH_SIZE: usize = 16;
 
 pub struct CrdsGossipPush {
@@ -138,7 +140,11 @@ impl CrdsGossipPush {
             values.retain(|value| wallclock_window.contains(&value.wallclock()));
         }
 
+        // Allocate result storage before taking the CRDS write lock. Keeping
+        // the original message Vecs alive also defers freeing their backing
+        // allocations until after the critical section.
         let num_values = messages.iter().map(|(_, values)| values.len()).sum();
+        let mut insert_results = Vec::with_capacity(num_values);
         let mut pending = messages.into_iter().flat_map(|(from, values)| {
             values.into_iter().map(move |value| {
                 let origin = value.pubkey();
@@ -150,7 +156,6 @@ impl CrdsGossipPush {
                 (origin, from, sampled_signature, value)
             })
         });
-        let mut insert_results = Vec::with_capacity(num_values);
         let mut batch = Vec::with_capacity(CRDS_GOSSIP_PUSH_INSERT_BATCH_SIZE);
         loop {
             batch.extend(pending.by_ref().take(CRDS_GOSSIP_PUSH_INSERT_BATCH_SIZE));
@@ -164,6 +169,9 @@ impl CrdsGossipPush {
             }
         }
 
+        // ReceivedCache is explicitly a lagging view. Updating it after CRDS
+        // insertion avoids both nesting its mutex with the CRDS lock and doing
+        // cache maintenance while excluding CRDS readers.
         let mut received_cache = self.received_cache.lock().unwrap();
         let mut origins = HashSet::with_capacity(insert_results.len());
         let mut num_old = 0;

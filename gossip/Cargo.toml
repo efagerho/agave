@@ -19,6 +19,7 @@ rustdoc-args = ["--cfg=docsrs"]
 bench = false
 
 [features]
+crds-lock-instrumentation = []
 frozen-abi = [
     "dep:solana-frozen-abi",
     "dep:solana-frozen-abi-macro",

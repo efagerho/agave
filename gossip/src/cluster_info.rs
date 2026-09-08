@@ -359,6 +359,9 @@ impl ClusterInfo {
         self.gossip.crds.write().set_contact_info_sender(sender);
     }
 
+    // Kept out of line so lock profiles retain a distinct symbolic acquisition
+    // path for the short pubkey-snapshot phase.
+    #[cfg_attr(feature = "crds-lock-instrumentation", inline(never))]
     fn save_contact_info_pubkeys(&self) -> Vec<Pubkey> {
         let gossip_crds = self.gossip.crds.read();
         gossip_crds
@@ -367,6 +370,9 @@ impl ClusterInfo {
             .collect()
     }
 
+    // Kept out of line so lock profiles retain a distinct symbolic acquisition
+    // path for each bounded clone phase.
+    #[cfg_attr(feature = "crds-lock-instrumentation", inline(never))]
     fn save_contact_info_batch(
         &self,
         pubkeys: &[Pubkey],
@@ -380,6 +386,12 @@ impl ClusterInfo {
             let label = CrdsValueLabel::ContactInfo(*pubkey);
             let value = gossip_crds.get::<&CrdsValue>(&label)?;
             let contact_info = value.contact_info().unwrap();
+            // Don't save:
+            // 1. Our ContactInfo. No point
+            // 2. Entrypoint ContactInfo. This will avoid adopting the incorrect shred
+            //    version on restart if the entrypoint shred version changes. Also
+            //    there's not much point in saving entrypoint ContactInfo since by
+            //    definition that information is already available.
             (contact_info.pubkey() != self_pubkey
                 && contact_info
                     .gossip()
@@ -582,6 +594,9 @@ impl ClusterInfo {
         gossip_crds.get(*id).map(query)
     }
 
+    // Kept out of line so lock profiles retain a distinct symbolic acquisition
+    // path for each bounded contact-info query phase.
+    #[cfg_attr(feature = "crds-lock-instrumentation", inline(never))]
     fn query_contact_infos_batch<R>(
         &self,
         peers: &[Pubkey],
@@ -1076,6 +1091,9 @@ impl ClusterInfo {
         }
     }
 
+    // Kept out of line so lock profiles retain a distinct symbolic acquisition
+    // path for each bounded vote clone phase.
+    #[cfg_attr(feature = "crds-lock-instrumentation", inline(never))]
     fn get_votes_batch(
         &self,
         cursor: &mut Cursor,
@@ -1113,6 +1131,9 @@ impl ClusterInfo {
         txs
     }
 
+    // Kept out of line so lock profiles retain a distinct symbolic acquisition
+    // path for each bounded vote-and-label clone phase.
+    #[cfg_attr(feature = "crds-lock-instrumentation", inline(never))]
     fn get_votes_with_labels_batch(
         &self,
         cursor: &mut Cursor,
@@ -1186,6 +1207,9 @@ impl ClusterInfo {
             .cloned()
     }
 
+    // Kept out of line so lock profiles retain a distinct symbolic acquisition
+    // path for each bounded epoch-slots clone phase.
+    #[cfg_attr(feature = "crds-lock-instrumentation", inline(never))]
     fn get_epoch_slots_batch(
         &self,
         cursor: &mut Cursor,
@@ -1260,6 +1284,9 @@ impl ClusterInfo {
             .collect()
     }
 
+    // Kept out of line so lock profiles retain a distinct symbolic acquisition
+    // path for the short all-peers pubkey snapshot.
+    #[cfg_attr(feature = "crds-lock-instrumentation", inline(never))]
     fn all_peers_pubkeys(&self) -> Vec<Pubkey> {
         let gossip_crds = self.gossip.crds.read();
         gossip_crds
@@ -1268,6 +1295,9 @@ impl ClusterInfo {
             .collect()
     }
 
+    // Kept out of line so lock profiles retain a distinct symbolic acquisition
+    // path for each bounded all-peers clone phase.
+    #[cfg_attr(feature = "crds-lock-instrumentation", inline(never))]
     fn all_peers_batch(&self, pubkeys: &[Pubkey], out: &mut Vec<(ContactInfo, u64)>) {
         debug_assert!(out.capacity() - out.len() >= pubkeys.len());
         let gossip_crds = self.gossip.crds.read();
@@ -1311,7 +1341,7 @@ impl ClusterInfo {
             .collect()
     }
 
-    /// all tvu peers with valid gossip addrs that likely have the slot being requested
+    /// All TVU peers with valid gossip addresses that likely have the requested slot.
     pub fn repair_peers(&self, slot: Slot) -> Vec<ContactInfo> {
         let _st = ScopedTimer::from(&self.stats.repair_peers);
         let self_pubkey = self.id();
@@ -1323,7 +1353,7 @@ impl ClusterInfo {
                     && self.check_socket_addr_space(&node.tvu(contact_info::Protocol::UDP))
                     && self.check_socket_addr_space(&node.serve_repair(contact_info::Protocol::UDP))
                     && match gossip_crds.get::<&LowestSlot>(*node.pubkey()) {
-                        None => true, // fallback to legacy behavior
+                        None => true,
                         Some(lowest_slot) => lowest_slot.lowest <= slot,
                     }
             })
@@ -1336,6 +1366,9 @@ impl ClusterInfo {
     pub fn repair_peer_endpoints(&self, slot: Slot) -> Vec<RepairPeer> {
         let _st = ScopedTimer::from(&self.stats.repair_peers);
         let self_pubkey = self.id();
+        // Copy only the fields needed for repair-peer selection while holding
+        // the CRDS lock. In particular, avoid cloning each ContactInfo under
+        // the lock and defer socket-address validation until after unlocking.
         let peers: Vec<_> = {
             let gossip_crds = self.gossip.crds.read();
             gossip_crds
@@ -3228,12 +3261,12 @@ mod tests {
         // Sets contact_info_path; no file to load yet.
         cluster_info_a.restore_contact_info(tmpdir.path(), 0);
 
-        let peer1 = ContactInfo::new_localhost(&solana_pubkey::new_rand(), timestamp());
-        let peer2 = ContactInfo::new_localhost(&solana_pubkey::new_rand(), timestamp());
-        let peer1_pubkey = *peer1.pubkey();
-        let peer2_pubkey = *peer2.pubkey();
-        cluster_info_a.insert_info(peer1);
-        cluster_info_a.insert_info(peer2);
+        let peer_pubkeys: Vec<_> = repeat_with(solana_pubkey::new_rand)
+            .take(2 * CONTACT_INFO_SNAPSHOT_BATCH_SIZE + 1)
+            .collect();
+        for pubkey in &peer_pubkeys {
+            cluster_info_a.insert_info(ContactInfo::new_localhost(pubkey, timestamp()));
+        }
         cluster_info_a.save_contact_info();
 
         let other_keypair = Arc::new(Keypair::new());
@@ -3243,18 +3276,14 @@ mod tests {
         cluster_info_b.restore_contact_info(tmpdir.path(), 0);
 
         let gossip_crds = cluster_info_b.gossip.crds.read();
-        assert!(
-            gossip_crds
-                .get::<&CrdsValue>(&CrdsValueLabel::ContactInfo(peer1_pubkey))
-                .is_some(),
-            "peer1 missing after restore"
-        );
-        assert!(
-            gossip_crds
-                .get::<&CrdsValue>(&CrdsValueLabel::ContactInfo(peer2_pubkey))
-                .is_some(),
-            "peer2 missing after restore"
-        );
+        for pubkey in peer_pubkeys {
+            assert!(
+                gossip_crds
+                    .get::<&CrdsValue>(&CrdsValueLabel::ContactInfo(pubkey))
+                    .is_some(),
+                "peer {pubkey} missing after restore"
+            );
+        }
     }
 
     fn assert_in_range(x: u16, range: (u16, u16)) {
@@ -3646,6 +3675,9 @@ mod tests {
             (expected_labels, expected_votes.clone())
         );
 
+        // Freeze the upper ordinal at the first batch. Entries inserted after
+        // that point must be left for the next call instead of extending this
+        // snapshot indefinitely.
         let mut cursor = Cursor::default();
         let mut snapshot = Vec::new();
         let snapshot_end = cluster_info.get_votes_batch(&mut cursor, None, &mut snapshot);
@@ -3975,9 +4007,10 @@ mod tests {
             node_keypair,
             SocketAddrSpace::Unspecified,
         );
-        for i in 0..10 {
+        let num_peers = 138;
+        for i in 0..num_peers {
             // make these invalid for the upcoming repair request
-            let peer_lowest = if i >= 5 { 10 } else { 0 };
+            let peer_lowest = if i >= num_peers / 2 { 10 } else { 0 };
             let other_node_pubkey = solana_pubkey::new_rand();
             let other_node = ContactInfo::new_localhost(&other_node_pubkey, timestamp());
             cluster_info.insert_info(other_node.clone());
@@ -3989,8 +4022,8 @@ mod tests {
             let _ = gossip_crds.insert(value, timestamp(), GossipRoute::LocalMessage);
         }
         // only half the visible peers should be eligible to serve this repair
-        assert_eq!(cluster_info.repair_peers(5).len(), 5);
-        assert_eq!(cluster_info.repair_peer_endpoints(5).len(), 5);
+        assert_eq!(cluster_info.repair_peers(5).len(), num_peers / 2);
+        assert_eq!(cluster_info.repair_peer_endpoints(5).len(), num_peers / 2);
     }
 
     #[test]

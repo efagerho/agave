@@ -440,6 +440,10 @@ impl CrdsGossipPull {
         (active_values, expired_values, failed_inserts)
     }
 
+    // Kept out of line so lock profiles retain a distinct symbolic acquisition
+    // path for each bounded pull-response classification phase. The caller
+    // preallocates `dispositions`, so this does not allocate while locked.
+    #[cfg_attr(feature = "crds-lock-instrumentation", inline(never))]
     fn filter_pull_responses_batch(
         crds: &parking_lot::RwLock<Crds>,
         timeouts: &CrdsTimeouts,
@@ -476,8 +480,8 @@ impl CrdsGossipPull {
         now: u64,
         stats: &mut ProcessPullStats,
     ) {
-        // Preserve the legacy order (expired responses first), while bounding
-        // the insertion work performed under one write guard.
+        // Preserve the legacy order (expired responses first), but bound the
+        // amount of insertion work performed under one write guard.
         let mut pending = responses_expired_timeout
             .into_iter()
             .map(|response| (false, response))
@@ -500,8 +504,9 @@ impl CrdsGossipPull {
                     owners.insert(owner);
                 }
             }
-            // Refresh once per owner under the insertion guard so purge cannot
-            // interleave between inserting the value and refreshing its record.
+            // Refresh once per owner, still under the insertion guard so purge
+            // cannot interleave. Without ContactInfo, a refresh scans the whole
+            // owner's record, so doing it per response repeats that work.
             for owner in owners.drain() {
                 crds.update_record_timestamp(&owner, now);
             }
@@ -539,8 +544,10 @@ impl CrdsGossipPull {
         bloom_size: usize,
     ) -> Vec<CrdsFilter> {
         const PAR_MIN_LENGTH: usize = 512;
-        // Counts are used only to size the filters, so they need not be read
-        // atomically with the subsequent snapshots.
+        // Read the collection sizes separately so that constructing the bloom
+        // filters does not extend either critical section. The counts are only
+        // used to size the filters; a concurrent insert between this count and
+        // the snapshot below does not affect correctness.
         let num_items = self.failed_inserts.read().unwrap().len();
         let num_items = {
             let crds = crds.read();
@@ -549,8 +556,15 @@ impl CrdsGossipPull {
         let num_items = MIN_NUM_BLOOM_ITEMS.max(num_items);
         let filters = CrdsFilterSet::new(&mut rand::rng(), num_items, bloom_size);
 
-        // Snapshot only prefixes that have active filters, releasing the read
-        // guard between disjoint prefixes. Bloom construction stays unlocked.
+        // Only one out of SAMPLE_RATE hash prefixes has an active bloom
+        // filter. Use the CRDS shard index to snapshot just those table hashes
+        // instead of walking and copying the whole table. The purged-hash
+        // index supports the same prefix-directed lookup. Failed hashes are a
+        // small, separate queue, so scan those and retain only active prefixes.
+        // Release the CRDS read lock between prefixes so that a waiting writer
+        // can make progress without waiting for the entire snapshot. Prefixes
+        // are disjoint, so this does not repeat any table or index traversal.
+        // The bloom-filter construction itself remains outside all locks.
         let mut hash_values = Vec::with_capacity(num_items.div_ceil(SAMPLE_RATE));
         for mask in filters.active_masks() {
             let crds = crds.read();
@@ -633,8 +647,9 @@ impl CrdsGossipPull {
             let mut candidates = Vec::new();
             let mut values = Vec::with_capacity(PULL_FILTER_BATCH_SIZE);
             for (mask, bits, count) in shards {
-                // Snapshot stable identifiers one hash shard at a time, then
-                // perform wallclock and Bloom checks after unlocking.
+                // Snapshot one existing hash shard at a time, rather than the
+                // entire request prefix. Labels and hashes let us revalidate
+                // candidates after unlocking. Reuse allocation across shards.
                 candidates.clear();
                 candidates.reserve(count);
                 {
@@ -657,8 +672,8 @@ impl CrdsGossipPull {
                 });
                 let mut remaining = candidates.as_slice();
                 while !remaining.is_empty() && out.len() < output_size_limit {
-                    // If candidates disappeared or are rejected after the
-                    // snapshot, continue until the output quota is filled.
+                    // Consume at most the remaining output quota. If values
+                    // disappear or are rejected, continue with the next slice.
                     let count = remaining
                         .len()
                         .min(PULL_FILTER_BATCH_SIZE)
@@ -723,10 +738,16 @@ impl CrdsGossipPull {
         num_purged
     }
 
+    // Kept out of line so lock profiles retain a distinct symbolic acquisition
+    // path for the short purge pubkey snapshot.
+    #[cfg_attr(feature = "crds-lock-instrumentation", inline(never))]
     fn purge_pubkey_snapshot(crds: &parking_lot::RwLock<Crds>) -> Vec<Pubkey> {
         crds.read().record_pubkeys().collect()
     }
 
+    // Kept out of line so lock profiles retain a distinct symbolic acquisition
+    // path for each bounded candidate-discovery phase.
+    #[cfg_attr(feature = "crds-lock-instrumentation", inline(never))]
     fn purge_find_candidates_batch(
         crds: &parking_lot::RwLock<Crds>,
         pubkeys: &[Pubkey],
@@ -737,6 +758,10 @@ impl CrdsGossipPull {
             .find_old_labels_for_pubkeys(pubkeys, now, timeouts)
     }
 
+    // Candidates can be replaced or refreshed after discovery, so every
+    // label is checked again while holding the write lock that removes it.
+    // Kept out of line to retain a distinct symbolic profiling path.
+    #[cfg_attr(feature = "crds-lock-instrumentation", inline(never))]
     fn purge_remove_batch(
         crds: &parking_lot::RwLock<Crds>,
         labels: &[crate::crds_value::CrdsValueLabel],
@@ -1131,7 +1156,7 @@ pub(crate) mod tests {
     #[test]
     fn test_new_pull_request() {
         let thread_pool = ThreadPoolBuilder::new().build().unwrap();
-        let crds = parking_lot::RwLock::default();
+        let crds = parking_lot::RwLock::<Crds>::default();
         let node_keypair = Keypair::new();
         let entry = CrdsValue::new_unsigned(CrdsData::from(ContactInfo::new_localhost(
             &node_keypair.pubkey(),
@@ -1352,7 +1377,7 @@ pub(crate) mod tests {
 
     #[test]
     fn test_pull_output_quota_with_rejected_candidates_and_multiple_shards() {
-        let crds = parking_lot::RwLock::default();
+        let crds = parking_lot::RwLock::<Crds>::default();
         for _ in 0..2 * PULL_FILTER_BATCH_SIZE + 1 {
             let value = CrdsValue::new_unsigned(CrdsData::from(ContactInfo::new_localhost(
                 &Pubkey::new_unique(),
@@ -1498,10 +1523,9 @@ pub(crate) mod tests {
     #[test]
     fn test_process_pull_responses_refreshes_owner_without_contact_info() {
         let owner = Pubkey::new_unique();
-        let crds = parking_lot::RwLock::default();
+        let crds = parking_lot::RwLock::<Crds>::default();
         let old = CrdsValue::new_unsigned(CrdsData::LowestSlot(0, LowestSlot::new(owner, 0, 0)));
         crds.write()
-            .unwrap()
             .insert(old, 0, GossipRoute::LocalMessage)
             .unwrap();
         let responses: Vec<_> = (0..2 * PULL_RESPONSE_INSERT_BATCH_SIZE + 1)
@@ -1584,6 +1608,7 @@ pub(crate) mod tests {
         node_crds.trim_purged(node.crds_timeout + 1);
         assert_eq!(node_crds.num_purged(), 0);
     }
+
     #[test]
     fn test_purge_remove_batch_revalidates_active_record() {
         let pubkey = Pubkey::new_unique();
@@ -1600,10 +1625,12 @@ pub(crate) mod tests {
             CrdsGossipPull::purge_find_candidates_batch(&crds, &[pubkey], 2, &timeouts);
         assert_eq!(candidates, vec![old_label.clone()]);
 
+        // Refresh the record after candidate discovery. The old associated
+        // value must survive removal revalidation while its contact-info
+        // origin is active.
         let contact_info = ContactInfo::new_localhost(&pubkey, 2);
         let contact_info = CrdsValue::new_unsigned(CrdsData::from(contact_info));
         crds.write()
-            .unwrap()
             .insert(contact_info, 2, GossipRoute::LocalMessage)
             .unwrap();
 

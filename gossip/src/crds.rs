@@ -188,14 +188,20 @@ where
         }
     }
 }
+/// Compact secondary view of the CRDS values used to select repair and gossip
+/// peers.
+///
+/// Keeping the contact-info fields and lowest slot together makes
+/// `ClusterInfo::repair_peers` a sequential scan instead of a scan over the
+/// ContactInfo index with an additional CRDS table lookup for every node.
 #[derive(Clone, Copy, Default)]
 struct RepairPeerIndexEntry {
-    contact_info: Option<RepairPeerContactInfo>,
+    contact_info: Option<PeerContactInfo>,
     lowest_slot: Option<Slot>,
 }
 
 #[derive(Clone, Copy)]
-struct RepairPeerContactInfo {
+struct PeerContactInfo {
     tvu: Option<SocketAddr>,
     serve_repair: Option<SocketAddr>,
     gossip: Option<SocketAddr>,
@@ -210,7 +216,7 @@ fn update_repair_peer_index(
     match value.value.data() {
         CrdsData::ContactInfo(node) => {
             let entry = repair_peers.entry(*node.pubkey()).or_default();
-            entry.contact_info = Some(RepairPeerContactInfo {
+            entry.contact_info = Some(PeerContactInfo {
                 tvu: node.tvu(Protocol::UDP),
                 serve_repair: node.serve_repair(Protocol::UDP),
                 gossip: node.gossip(),
@@ -259,6 +265,7 @@ pub struct Crds {
     cursor: Cursor, // Next insert ordinal location.
     shards: CrdsShards,
     nodes: IndexSet<usize>, // Indices of nodes' ContactInfo.
+    // Compact ContactInfo and LowestSlot fields used by repair-peer selection.
     repair_peers: IndexMap<Pubkey, RepairPeerIndexEntry>,
     // Indices of Votes keyed by insert order.
     votes: BTreeMap<u64 /*insert order*/, usize /*index*/>,
@@ -427,6 +434,8 @@ fn emit_contact_info_event(sender: Option<&ContactInfoSender>, event: ContactInf
 }
 
 impl Crds {
+    /// Returns the next insertion ordinal. Callers can use this as an exclusive
+    /// upper bound for a finite snapshot split across several lock acquisitions.
     pub(crate) fn next_ordinal(&self) -> u64 {
         self.cursor.ordinal()
     }
@@ -588,6 +597,9 @@ impl Crds {
         })
     }
 
+    /// Returns the compact repair-peer fields for nodes whose advertised
+    /// lowest slot does not exclude `slot`. A missing LowestSlot preserves the
+    /// legacy behavior and leaves the node eligible.
     pub(crate) fn get_repair_peers(
         &self,
         slot: Slot,
@@ -604,6 +616,8 @@ impl Crds {
         })
     }
 
+    /// Returns compact fields needed by gossip-node selection without
+    /// dereferencing the main CRDS table for every ContactInfo record.
     pub(crate) fn get_gossip_nodes(
         &self,
     ) -> impl Iterator<Item = (Option<SocketAddr>, u16, Pubkey, u64)> + '_ {
@@ -632,6 +646,9 @@ impl Crds {
         })
     }
 
+    /// Returns vote entries in `[cursor, end_ordinal)`, updating the cursor as
+    /// values are consumed. The exclusive upper bound prevents a batched
+    /// reader from chasing entries inserted after its snapshot began.
     pub(crate) fn get_votes_until<'a>(
         &'a self,
         cursor: &'a mut Cursor,
@@ -661,6 +678,8 @@ impl Crds {
         })
     }
 
+    /// Returns epoch-slot entries in `[cursor, end_ordinal)`, updating the
+    /// cursor as values are consumed.
     pub(crate) fn get_epoch_slots_until<'a>(
         &'a self,
         cursor: &'a mut Cursor,
@@ -767,6 +786,19 @@ impl Crds {
             .filter(move |VersionedCrdsValue { value, .. }| !value.data().is_deprecated())
     }
 
+    /// Returns hashes of all CRDS values whose first `mask_bits` bits match
+    /// `mask`. Unlike [`Self::filter_bitmask`], this includes deprecated
+    /// values because pull-request bloom filters cover every value in CRDS.
+    pub(crate) fn filter_bitmask_hashes(
+        &self,
+        mask: u64,
+        mask_bits: u32,
+    ) -> impl Iterator<Item = Hash> + '_ {
+        self.shards
+            .find(mask, mask_bits)
+            .map(move |index| *self.table.index(index).value.hash())
+    }
+
     pub(crate) fn filter_bitmask_scan_count(&self, mask: u64, mask_bits: u32) -> usize {
         self.shards.find_count(mask, mask_bits)
     }
@@ -786,19 +818,6 @@ impl Crds {
             let mask = (first + offset as u64) << (64 - bits);
             (CrdsFilter::canonical_mask(mask, bits), bits)
         })
-    }
-
-    /// Returns hashes of all CRDS values whose first `mask_bits` bits match
-    /// `mask`. Unlike [`Self::filter_bitmask`], this includes deprecated
-    /// values because pull-request bloom filters cover every value in CRDS.
-    pub(crate) fn filter_bitmask_hashes(
-        &self,
-        mask: u64,
-        mask_bits: u32,
-    ) -> impl Iterator<Item = Hash> + '_ {
-        self.shards
-            .find(mask, mask_bits)
-            .map(move |index| *self.table.index(index).value.hash())
     }
 
     #[cfg(test)]
@@ -864,10 +883,14 @@ impl Crds {
         })
     }
 
+    /// Returns a stable identifier for every record currently in CRDS.
     pub(crate) fn record_pubkeys(&self) -> impl Iterator<Item = Pubkey> + '_ {
         self.records.keys().copied()
     }
 
+    /// Finds old labels for only the requested records. Pubkeys absent from
+    /// the current table are ignored, allowing callers to use an earlier
+    /// pubkey snapshot safely across separate read-lock acquisitions.
     pub(crate) fn find_old_labels_for_pubkeys(
         &self,
         pubkeys: &[Pubkey],
@@ -883,6 +906,7 @@ impl Crds {
             .collect()
     }
 
+    /// Revalidates an earlier purge candidate against the current CRDS state.
     pub(crate) fn is_old_label(
         &self,
         label: &CrdsValueLabel,
@@ -904,6 +928,8 @@ impl Crds {
             <= now
     }
 
+    // Returns old labels associated with one pubkey. `index` must be the
+    // current records index for `pubkey`.
     fn find_old_labels_for_record<'a>(
         &'a self,
         pubkey: &Pubkey,
@@ -1209,30 +1235,35 @@ mod tests {
         purged.push_back((hash_0001, 4));
         assert_eq!(purged.len(), 4);
 
+        // Fewer mask bits than shard bits combines multiple shards.
         let hashes: Vec<_> = purged.find(0, 2).collect();
         assert_eq!(hashes.len(), 3);
         assert_eq!(hashes.iter().filter(|&&hash| hash == hash_0001).count(), 2);
         assert!(hashes.contains(&hash_0011));
+
+        // Equal mask and shard widths selects exactly one shard.
         assert_eq!(
             purged.find(0x2000_0000_0000_0000, 3).collect::<Vec<_>>(),
             vec![hash_0011]
         );
+        // More mask bits than shard bits filters inside one shard.
         assert_eq!(
             purged.find(0x1000_0000_0000_0000, 4).collect::<Vec<_>>(),
             vec![hash_0001, hash_0001]
         );
 
+        // Expiration is preserved independently within each prefix shard.
         purged.trim(3);
         assert_eq!(purged.len(), 2);
         let hashes: Vec<_> = purged.hashes().collect();
         assert!(hashes.contains(&hash_1000));
         assert!(hashes.contains(&hash_0001));
-        purged.trim(3);
+        purged.trim(3); // A timestamp equal to the cutoff is retained.
         assert_eq!(purged.len(), 2);
         purged.trim(4);
         assert_eq!(purged.hashes().collect::<Vec<_>>(), vec![hash_0001]);
         purged.trim(5);
-        purged.trim(u64::MAX);
+        purged.trim(u64::MAX); // Trimming an empty queue is harmless.
         assert!(purged.is_empty());
     }
 

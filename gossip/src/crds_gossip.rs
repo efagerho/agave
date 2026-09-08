@@ -324,6 +324,9 @@ type GossipNodeSnapshot = (
     /* local timestamp */ u64,
 );
 
+// Keep this out of line so lock profiles retain a durable symbolic path for
+// the only part of gossip-node selection which needs the CRDS read lock.
+#[cfg_attr(feature = "crds-lock-instrumentation", inline(never))]
 fn snapshot_gossip_nodes(crds: &RwLock<Crds>) -> Vec<GossipNodeSnapshot> {
     let crds = crds.read();
     crds.get_gossip_nodes().collect()
