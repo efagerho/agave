@@ -331,7 +331,7 @@ pub struct VersionedCrdsValue {
 pub struct Cursor(u64);
 
 impl Cursor {
-    fn ordinal(&self) -> u64 {
+    pub(crate) fn ordinal(&self) -> u64 {
         self.0
     }
 
@@ -427,6 +427,10 @@ fn emit_contact_info_event(sender: Option<&ContactInfoSender>, event: ContactInf
 }
 
 impl Crds {
+    pub(crate) fn next_ordinal(&self) -> u64 {
+        self.cursor.ordinal()
+    }
+
     /// Returns true if the given value updates an existing one in the table.
     /// The value is outdated and fails to insert, if it already exists in the
     /// table with a more recent wallclock.
@@ -629,11 +633,27 @@ impl Crds {
 
     /// Returns epoch-slots inserted since the given cursor.
     /// Updates the cursor as the values are consumed.
+    #[cfg(test)]
     pub(crate) fn get_epoch_slots<'a>(
         &'a self,
         cursor: &'a mut Cursor,
     ) -> impl Iterator<Item = &'a VersionedCrdsValue> {
         let range = (Bound::Included(cursor.ordinal()), Bound::Unbounded);
+        self.epoch_slots.range(range).map(move |(ordinal, index)| {
+            cursor.consume(*ordinal);
+            self.table.index(*index)
+        })
+    }
+
+    pub(crate) fn get_epoch_slots_until<'a>(
+        &'a self,
+        cursor: &'a mut Cursor,
+        end_ordinal: u64,
+    ) -> impl Iterator<Item = &'a VersionedCrdsValue> {
+        let range = (
+            Bound::Included(cursor.ordinal()),
+            Bound::Excluded(end_ordinal),
+        );
         self.epoch_slots.range(range).map(move |(ordinal, index)| {
             cursor.consume(*ordinal);
             self.table.index(*index)

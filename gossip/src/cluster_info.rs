@@ -144,6 +144,7 @@ fn pull_request_scan_cost(scan_entries: usize, bloom_hash_count: usize) -> u64 {
 pub const DEFAULT_CONTACT_DEBUG_INTERVAL_MILLIS: u64 = 10_000;
 pub const DEFAULT_CONTACT_SAVE_INTERVAL_MILLIS: u64 = 60_000;
 const CONTACT_INFO_SNAPSHOT_BATCH_SIZE: usize = 64;
+const EPOCH_SLOTS_SNAPSHOT_BATCH_SIZE: usize = 64;
 // Limit number of unique pubkeys in the crds table.
 pub(crate) const CRDS_UNIQUE_PUBKEY_CAPACITY: usize = 8192;
 
@@ -1138,16 +1139,39 @@ impl ClusterInfo {
             .cloned()
     }
 
+    fn get_epoch_slots_batch(
+        &self,
+        cursor: &mut Cursor,
+        end_ordinal: Option<u64>,
+        out: &mut Vec<EpochSlots>,
+    ) -> u64 {
+        out.reserve(EPOCH_SLOTS_SNAPSHOT_BATCH_SIZE);
+        let gossip_crds = self.gossip.crds.read();
+        let end_ordinal = end_ordinal.unwrap_or_else(|| gossip_crds.next_ordinal());
+        out.extend(
+            gossip_crds
+                .get_epoch_slots_until(cursor, end_ordinal)
+                .take(EPOCH_SLOTS_SNAPSHOT_BATCH_SIZE)
+                .map(|entry| match entry.value.data() {
+                    CrdsData::EpochSlots(_, slots) => slots.clone(),
+                    _ => panic!("this should not happen!"),
+                }),
+        );
+        end_ordinal
+    }
+
     /// Returns epoch-slots inserted since the given cursor.
     pub fn get_epoch_slots(&self, cursor: &mut Cursor) -> Vec<EpochSlots> {
-        let gossip_crds = self.gossip.crds.read();
-        gossip_crds
-            .get_epoch_slots(cursor)
-            .map(|entry| match entry.value.data() {
-                CrdsData::EpochSlots(_, slots) => slots.clone(),
-                _ => panic!("this should not happen!"),
-            })
-            .collect()
+        let mut slots = Vec::new();
+        let mut end_ordinal = None;
+        loop {
+            let start = slots.len();
+            end_ordinal = Some(self.get_epoch_slots_batch(cursor, end_ordinal, &mut slots));
+            if slots.len() - start < EPOCH_SLOTS_SNAPSHOT_BATCH_SIZE {
+                break;
+            }
+        }
+        slots
     }
 
     /// Returns duplicate-shreds inserted since the given cursor.
@@ -3582,6 +3606,33 @@ mod tests {
 
         let slots = cluster_info.get_epoch_slots(&mut cursor);
         assert!(slots.is_empty());
+    }
+
+    #[test]
+    fn test_get_epoch_slots_batches_preserve_order_and_cursor() {
+        let keypair = Arc::new(Keypair::new());
+        let contact_info = ContactInfo::new_localhost(&keypair.pubkey(), 0);
+        let cluster_info = ClusterInfo::new(contact_info, keypair, SocketAddrSpace::Unspecified);
+        let mut expected = Vec::new();
+        for slot in 0..2 * EPOCH_SLOTS_SNAPSHOT_BATCH_SIZE + 1 {
+            let pubkey = solana_pubkey::new_rand();
+            let mut epoch_slots = EpochSlots::new(pubkey, timestamp());
+            assert_eq!(epoch_slots.fill(&[slot as Slot], timestamp()), 1);
+            let value = CrdsValue::new_unsigned(CrdsData::EpochSlots(0, epoch_slots.clone()));
+            assert_matches!(
+                cluster_info.gossip.crds.write().insert(
+                    value,
+                    timestamp(),
+                    GossipRoute::LocalMessage,
+                ),
+                Ok(())
+            );
+            expected.push(epoch_slots);
+        }
+
+        let mut cursor = Cursor::default();
+        assert_eq!(cluster_info.get_epoch_slots(&mut cursor), expected);
+        assert!(cluster_info.get_epoch_slots(&mut cursor).is_empty());
     }
 
     #[test]
