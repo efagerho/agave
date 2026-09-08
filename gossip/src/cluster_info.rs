@@ -17,7 +17,7 @@ use {
     crate::{
         cluster_info_metrics::{Counter, GossipStats, ScopedTimer, TimedGuard},
         contact_info::{self, ContactInfo, ContactInfoQuery, Error as ContactInfoError},
-        crds::{Crds, Cursor, GossipRoute},
+        crds::{Crds, Cursor, GossipRoute, VersionedCrdsValue},
         crds_data::{self, CrdsData, EpochSlotsIndex, LowestSlot, MAX_VOTES, SnapshotHashes, Vote},
         crds_filter::{GossipFilterDirection, should_retain_crds_value},
         crds_gossip::CrdsGossip,
@@ -1260,16 +1260,32 @@ impl ClusterInfo {
             .collect()
     }
 
-    // All nodes in gossip (including spy nodes) and the last time we heard about them
-    pub fn all_peers(&self) -> Vec<(ContactInfo, u64)> {
+    fn all_peers_pubkeys(&self) -> Vec<Pubkey> {
         let gossip_crds = self.gossip.crds.read();
         gossip_crds
-            .get_nodes()
-            .filter_map(|node| {
-                let contact_info = node.value.contact_info()?;
-                Some((contact_info.clone(), node.local_timestamp))
-            })
+            .get_nodes_contact_info()
+            .map(|node| *node.pubkey())
             .collect()
+    }
+
+    fn all_peers_batch(&self, pubkeys: &[Pubkey], out: &mut Vec<(ContactInfo, u64)>) {
+        debug_assert!(out.capacity() - out.len() >= pubkeys.len());
+        let gossip_crds = self.gossip.crds.read();
+        out.extend(pubkeys.iter().filter_map(|pubkey| {
+            let label = CrdsValueLabel::ContactInfo(*pubkey);
+            let node = gossip_crds.get::<&VersionedCrdsValue>(&label)?;
+            Some((node.value.contact_info()?.clone(), node.local_timestamp))
+        }));
+    }
+
+    // All nodes in gossip (including spy nodes) and the last time we heard about them.
+    pub fn all_peers(&self) -> Vec<(ContactInfo, u64)> {
+        let pubkeys = self.all_peers_pubkeys();
+        let mut nodes = Vec::with_capacity(pubkeys.len());
+        for pubkeys in pubkeys.chunks(CONTACT_INFO_SNAPSHOT_BATCH_SIZE) {
+            self.all_peers_batch(pubkeys, &mut nodes);
+        }
+        nodes
     }
 
     pub fn gossip_peers(&self) -> Vec<ContactInfo> {
@@ -3168,6 +3184,37 @@ mod tests {
             (*pubkey, value)
         });
         assert_eq!(actual, expected.collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn test_all_peers_batches_preserve_local_timestamps() {
+        let keypair = Arc::new(Keypair::new());
+        let contact_info = ContactInfo::new_localhost(&keypair.pubkey(), timestamp());
+        let cluster_info = ClusterInfo::new(contact_info, keypair, SocketAddrSpace::Unspecified);
+        let mut expected = HashMap::new();
+        for local_timestamp in 1..=2 * CONTACT_INFO_SNAPSHOT_BATCH_SIZE + 1 {
+            let pubkey = solana_pubkey::new_rand();
+            let contact_info = ContactInfo::new_localhost(&pubkey, local_timestamp as u64);
+            let value = CrdsValue::new_unsigned(CrdsData::from(contact_info));
+            assert_matches!(
+                cluster_info.gossip.crds.write().insert(
+                    value,
+                    local_timestamp as u64,
+                    GossipRoute::LocalMessage,
+                ),
+                Ok(())
+            );
+            expected.insert(pubkey, local_timestamp as u64);
+        }
+
+        let peers: HashMap<_, _> = cluster_info
+            .all_peers()
+            .into_iter()
+            .map(|(contact_info, local_timestamp)| (*contact_info.pubkey(), local_timestamp))
+            .collect();
+        for (pubkey, local_timestamp) in expected {
+            assert_eq!(peers.get(&pubkey), Some(&local_timestamp));
+        }
     }
 
     #[test]
