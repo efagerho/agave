@@ -771,6 +771,23 @@ impl Crds {
         self.shards.find_count(mask, mask_bits)
     }
 
+    /// Splits a prefix into disjoint existing hash shards, in traversal order.
+    /// Finer prefixes already fit in one shard and are left unchanged.
+    pub(crate) fn filter_bitmask_shards(
+        mask: u64,
+        mask_bits: u32,
+    ) -> impl ExactSizeIterator<Item = (u64, u32)> {
+        assert!(mask_bits <= u64::BITS);
+        let mask = CrdsFilter::canonical_mask(mask, mask_bits);
+        let bits = mask_bits.max(CRDS_SHARDS_BITS);
+        let count = 1usize << CRDS_SHARDS_BITS.saturating_sub(mask_bits);
+        let first = (mask >> (64 - bits)) & !(count as u64 - 1);
+        (0..count).map(move |offset| {
+            let mask = (first + offset as u64) << (64 - bits);
+            (CrdsFilter::canonical_mask(mask, bits), bits)
+        })
+    }
+
     /// Returns hashes of all CRDS values whose first `mask_bits` bits match
     /// `mask`. Unlike [`Self::filter_bitmask`], this includes deprecated
     /// values because pull-request bloom filters cover every value in CRDS.
@@ -1217,6 +1234,36 @@ mod tests {
         purged.trim(5);
         purged.trim(u64::MAX);
         assert!(purged.is_empty());
+    }
+
+    #[test]
+    fn test_filter_bitmask_shards_preserves_traversal_and_scan_cost() {
+        let mut crds = Crds::default();
+        for _ in 0..256 {
+            let value = CrdsValue::new_unsigned(CrdsData::from(ContactInfo::new_localhost(
+                &Pubkey::new_unique(),
+                0,
+            )));
+            crds.insert(value, 0, GossipRoute::LocalMessage).unwrap();
+        }
+        let hash = *crds.values().next().unwrap().value.hash();
+        for bits in [0, 1, 7, CRDS_SHARDS_BITS, CRDS_SHARDS_BITS + 1, 32, 63, 64] {
+            for mask in [0, u64::MAX, CrdsFilter::hash_as_u64(&hash)] {
+                let expected: Vec<_> = crds
+                    .filter_bitmask(mask, bits)
+                    .map(|value| *value.value.hash())
+                    .collect();
+                let actual: Vec<_> = Crds::filter_bitmask_shards(mask, bits)
+                    .flat_map(|(mask, bits)| crds.filter_bitmask(mask, bits))
+                    .map(|value| *value.value.hash())
+                    .collect();
+                assert_eq!(actual, expected, "mask={mask:x}, bits={bits}");
+                let cost: usize = Crds::filter_bitmask_shards(mask, bits)
+                    .map(|(mask, bits)| crds.filter_bitmask_scan_count(mask, bits))
+                    .sum();
+                assert_eq!(cost, crds.filter_bitmask_scan_count(mask, bits));
+            }
+        }
     }
 
     #[test]

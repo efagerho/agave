@@ -17,7 +17,7 @@ use {
     crate::{
         cluster_info_metrics::GossipStats,
         contact_info::ContactInfo,
-        crds::{Crds, GossipRoute, VersionedCrdsValue},
+        crds::{Crds, GossipRoute},
         crds_gossip,
         crds_gossip_error::CrdsGossipError,
         crds_value::CrdsValue,
@@ -60,6 +60,7 @@ pub const CRDS_GOSSIP_PURGE_DURATION: Duration = Duration::from_secs(2 * 24 * 60
 // Retention period of hashes of received outdated values.
 const FAILED_INSERTS_RETENTION_MS: u64 = 20_000;
 const PURGE_BATCH_SIZE: usize = 32;
+const PULL_FILTER_BATCH_SIZE: usize = 64;
 const PULL_RESPONSE_FILTER_BATCH_SIZE: usize = 32;
 const PULL_RESPONSE_INSERT_BATCH_SIZE: usize = 32;
 pub const FALSE_RATE: f64 = 0.1f64;
@@ -159,6 +160,7 @@ impl CrdsFilter {
         let buf = item.as_ref()[..8].try_into().unwrap();
         u64::from_le_bytes(buf)
     }
+    #[cfg(test)]
     fn test_mask(&self, item: &Hash) -> bool {
         Self::hash_matches_mask_prefix(self.mask, self.mask_bits, Self::hash_as_u64(item))
     }
@@ -593,44 +595,98 @@ impl CrdsGossipPull {
             now.saturating_sub(msg_timeout)..now.saturating_add(msg_timeout);
         let mut dropped_requests = 0usize;
         let mut total_skipped = 0usize;
-        let crds = crds.read();
-        let apply_filter = |request: &PullRequest| {
+        let mut ret = Vec::with_capacity(requests.len());
+        for request in requests {
             if output_size_limit == 0 {
-                return Vec::default();
+                ret.push(Vec::default());
+                continue;
             }
             let filter = &request.filter;
             let caller_wallclock = request.wallclock;
             if !caller_wallclock_window.contains(&caller_wallclock) {
                 dropped_requests += 1;
-                return Vec::default();
+                ret.push(Vec::default());
+                continue;
             }
-            let scan_len = crds.filter_bitmask_scan_count(filter.mask, filter.mask_bits);
+            let masks = Crds::filter_bitmask_shards(filter.mask, filter.mask_bits);
+            let mut shards = Vec::with_capacity(masks.len());
+            let scan_len = {
+                let crds = crds.read();
+                let mut scan_len = 0;
+                for (mask, bits) in masks {
+                    let count = crds.filter_bitmask_scan_count(mask, bits);
+                    scan_len += count;
+                    if count != 0 {
+                        shards.push((mask, bits, count));
+                    }
+                }
+                scan_len
+            };
             // Charge only requests that passed cheaper pre-scan checks.
             if !try_consume_scan_budget(request, scan_len) {
-                return Vec::default();
+                ret.push(Vec::default());
+                continue;
             }
+
             let caller_wallclock = caller_wallclock.checked_add(jitter).unwrap_or(0);
-            let pred = |entry: &&VersionedCrdsValue| {
-                debug_assert!(filter.test_mask(entry.value.hash()));
-                // Skip values that are too new.
-                if entry.value.wallclock() > caller_wallclock {
-                    total_skipped += 1;
-                    false
-                } else {
-                    !filter.filter_contains(entry.value.hash())
-                        && should_retain_crds_value(&entry.value)
+            let mut out = Vec::new();
+            let mut candidates = Vec::new();
+            let mut values = Vec::with_capacity(PULL_FILTER_BATCH_SIZE);
+            for (mask, bits, count) in shards {
+                // Snapshot stable identifiers one hash shard at a time, then
+                // perform wallclock and Bloom checks after unlocking.
+                candidates.clear();
+                candidates.reserve(count);
+                {
+                    let crds = crds.read();
+                    candidates.extend(crds.filter_bitmask(mask, bits).map(|entry| {
+                        (
+                            entry.value.label(),
+                            *entry.value.hash(),
+                            entry.value.wallclock(),
+                        )
+                    }));
                 }
-            };
-            let out: Vec<_> = crds
-                .filter_bitmask(filter.mask, filter.mask_bits)
-                .filter(pred)
-                .map(|entry| entry.value.clone())
-                .take(output_size_limit)
-                .collect();
+                candidates.retain(|(_label, hash, wallclock)| {
+                    if *wallclock > caller_wallclock {
+                        total_skipped += 1;
+                        false
+                    } else {
+                        !filter.filter_contains(hash)
+                    }
+                });
+                let mut remaining = candidates.as_slice();
+                while !remaining.is_empty() && out.len() < output_size_limit {
+                    // If candidates disappeared or are rejected after the
+                    // snapshot, continue until the output quota is filled.
+                    let count = remaining
+                        .len()
+                        .min(PULL_FILTER_BATCH_SIZE)
+                        .min(output_size_limit - out.len());
+                    let (batch, rest) = remaining.split_at(count);
+                    remaining = rest;
+                    {
+                        let crds = crds.read();
+                        values.extend(batch.iter().filter_map(|(label, hash, _)| {
+                            crds.get::<&CrdsValue>(label)
+                                .filter(|value| value.hash() == hash)
+                                .filter(|value| !value.data().is_deprecated())
+                                .cloned()
+                        }));
+                    }
+                    for value in values.drain(..) {
+                        if should_retain_crds_value(&value) {
+                            out.push(value);
+                        }
+                    }
+                }
+                if out.len() == output_size_limit {
+                    break;
+                }
+            }
             output_size_limit = output_size_limit.saturating_sub(out.len());
-            out
-        };
-        let ret: Vec<_> = requests.iter().map(apply_filter).collect();
+            ret.push(out);
+        }
         stats
             .filter_crds_values_dropped_requests
             .add_relaxed(dropped_requests as u64);
@@ -795,7 +851,7 @@ pub(crate) mod tests {
         super::*,
         crate::{
             cluster_info::{GOSSIP_PING_CACHE_OUTSTANDING_PING_TIMEOUT_MS, GOSSIP_PING_CACHE_TTL},
-            crds::Crds,
+            crds::VersionedCrdsValue,
             crds_data::{CrdsData, LowestSlot},
             protocol::Protocol,
         },
@@ -1292,6 +1348,70 @@ pub(crate) mod tests {
         assert_eq!(rsp.len(), 2);
         assert!(rsp[0].is_empty());
         assert_eq!(rsp[1], vec![new]);
+    }
+
+    #[test]
+    fn test_pull_output_quota_with_rejected_candidates_and_multiple_shards() {
+        let crds = parking_lot::RwLock::default();
+        for _ in 0..2 * PULL_FILTER_BATCH_SIZE + 1 {
+            let value = CrdsValue::new_unsigned(CrdsData::from(ContactInfo::new_localhost(
+                &Pubkey::new_unique(),
+                1,
+            )));
+            crds.write()
+                .insert(value, 1, GossipRoute::LocalMessage)
+                .unwrap();
+        }
+        let filter = CrdsFilter::new_rand(1, PACKET_DATA_SIZE);
+        let expected: Vec<_> = crds
+            .read()
+            .filter_bitmask(filter.mask, filter.mask_bits)
+            .map(|entry| entry.value.clone())
+            .collect();
+        let make_request = || PullRequest {
+            pubkey: Pubkey::new_unique(),
+            addr: SocketAddr::from(([0; 4], 0)),
+            wallclock: 1,
+            filter: filter.clone(),
+        };
+        let requests = [make_request(), make_request()];
+        for limit in [0, 1, 2, PULL_FILTER_BATCH_SIZE + 1, usize::MAX] {
+            // Reject the first 65 candidates, so a small quota cannot be
+            // implemented by taking only that many candidates and stopping.
+            let retain = |value: &CrdsValue| expected[PULL_FILTER_BATCH_SIZE + 1..].contains(value);
+            let actual = CrdsGossipPull::generate_pull_responses(
+                &crds,
+                &requests,
+                limit,
+                1,
+                retain,
+                |_, _| true,
+                &GossipStats::default(),
+            );
+            let first: Vec<_> = expected
+                .iter()
+                .filter(|value| retain(value))
+                .take(limit)
+                .cloned()
+                .collect();
+            let second: Vec<_> = expected
+                .iter()
+                .filter(|value| retain(value))
+                .take(limit.saturating_sub(first.len()))
+                .cloned()
+                .collect();
+            assert_eq!(actual, vec![first, second]);
+        }
+        let rejected = CrdsGossipPull::generate_pull_responses(
+            &crds,
+            &requests,
+            1,
+            1,
+            |_| panic!("budget rejection must skip candidates"),
+            |_, _| false,
+            &GossipStats::default(),
+        );
+        assert!(rejected.iter().all(Vec::is_empty));
     }
 
     #[test]
