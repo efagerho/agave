@@ -580,6 +580,23 @@ impl ClusterInfo {
         gossip_crds.get(*id).map(query)
     }
 
+    fn query_contact_infos_batch<R>(
+        &self,
+        peers: &[Pubkey],
+        query: &impl ContactInfoQuery<R>,
+        out: &mut Vec<(Pubkey, Option<R>)>,
+    ) {
+        let read_guard = self.gossip.crds.read();
+        out.extend(peers.iter().map(|id| {
+            (
+                *id,
+                read_guard
+                    .get(*id)
+                    .map(|contact_info: &ContactInfo| query(contact_info)),
+            )
+        }));
+    }
+
     /// Resolve `query` on ContactInfo for `peers`.
     /// Yields one entry per pubkey in `peers`, or `None` when peer is absent.
     pub fn query_contact_infos<'a, R>(
@@ -587,11 +604,12 @@ impl ClusterInfo {
         peers: impl IntoIterator<Item = &'a Pubkey>,
         query: impl ContactInfoQuery<R>,
     ) -> Vec<(Pubkey, Option<R>)> {
-        let read_guard = self.gossip.crds.read();
-        peers
-            .into_iter()
-            .map(|id| (*id, read_guard.get(*id).map(|ci: &ContactInfo| query(ci))))
-            .collect()
+        let peers: Vec<_> = peers.into_iter().copied().collect();
+        let mut out = Vec::with_capacity(peers.len());
+        for peers in peers.chunks(CONTACT_INFO_SNAPSHOT_BATCH_SIZE) {
+            self.query_contact_infos_batch(peers, &query, &mut out);
+        }
+        out
     }
 
     pub fn lookup_contact_info_by_gossip_addr(
@@ -3057,6 +3075,28 @@ mod tests {
         cluster_info.insert_info(d);
         let gossip_crds = cluster_info.gossip.crds.read();
         assert!(gossip_crds.get::<&CrdsValue>(&label).is_some());
+    }
+
+    #[test]
+    fn test_query_contact_infos_batches_preserve_order_and_missing_peers() {
+        let keypair = Arc::new(Keypair::new());
+        let contact_info = ContactInfo::new_localhost(&keypair.pubkey(), timestamp());
+        let cluster_info = ClusterInfo::new(contact_info, keypair, SocketAddrSpace::Unspecified);
+        let mut peers: Vec<_> = repeat_with(solana_pubkey::new_rand)
+            .take(2 * CONTACT_INFO_SNAPSHOT_BATCH_SIZE + 1)
+            .collect();
+        for pubkey in &peers {
+            cluster_info.insert_info(ContactInfo::new_localhost(pubkey, timestamp()));
+        }
+        let missing = solana_pubkey::new_rand();
+        peers.insert(CONTACT_INFO_SNAPSHOT_BATCH_SIZE, missing);
+
+        let actual = cluster_info.query_contact_infos(peers.iter(), |node| *node.pubkey());
+        let expected = peers.iter().map(|pubkey| {
+            let value = (*pubkey != missing).then_some(*pubkey);
+            (*pubkey, value)
+        });
+        assert_eq!(actual, expected.collect::<Vec<_>>());
     }
 
     #[test]
