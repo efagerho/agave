@@ -59,6 +59,7 @@ pub const CRDS_GOSSIP_PULL_CRDS_TIMEOUT_MS: u64 = 15000;
 pub const CRDS_GOSSIP_PURGE_DURATION: Duration = Duration::from_secs(2 * 24 * 60 * 60);
 // Retention period of hashes of received outdated values.
 const FAILED_INSERTS_RETENTION_MS: u64 = 20_000;
+const PURGE_BATCH_SIZE: usize = 32;
 const PULL_RESPONSE_FILTER_BATCH_SIZE: usize = 32;
 pub const FALSE_RATE: f64 = 0.1f64;
 pub const KEYS: f64 = 8f64;
@@ -636,17 +637,51 @@ impl CrdsGossipPull {
 
     /// Purge values from the crds that are older then `active_timeout`
     pub(crate) fn purge_active(
-        thread_pool: &ThreadPool,
+        _thread_pool: &ThreadPool,
         crds: &parking_lot::RwLock<Crds>,
         now: u64,
         timeouts: &CrdsTimeouts,
     ) -> usize {
-        let mut crds = crds.write();
-        let labels = crds.find_old_labels(thread_pool, now, timeouts);
-        for label in &labels {
-            crds.remove(label, now);
+        let pubkeys = Self::purge_pubkey_snapshot(crds);
+        let mut num_purged = 0;
+        for pubkeys in pubkeys.chunks(PURGE_BATCH_SIZE) {
+            let labels = Self::purge_find_candidates_batch(crds, pubkeys, now, timeouts);
+            for labels in labels.chunks(PURGE_BATCH_SIZE) {
+                num_purged += Self::purge_remove_batch(crds, labels, now, timeouts);
+            }
         }
-        labels.len()
+        num_purged
+    }
+
+    fn purge_pubkey_snapshot(crds: &parking_lot::RwLock<Crds>) -> Vec<Pubkey> {
+        crds.read().record_pubkeys().collect()
+    }
+
+    fn purge_find_candidates_batch(
+        crds: &parking_lot::RwLock<Crds>,
+        pubkeys: &[Pubkey],
+        now: u64,
+        timeouts: &CrdsTimeouts,
+    ) -> Vec<crate::crds_value::CrdsValueLabel> {
+        crds.read()
+            .find_old_labels_for_pubkeys(pubkeys, now, timeouts)
+    }
+
+    fn purge_remove_batch(
+        crds: &parking_lot::RwLock<Crds>,
+        labels: &[crate::crds_value::CrdsValueLabel],
+        now: u64,
+        timeouts: &CrdsTimeouts,
+    ) -> usize {
+        let mut crds = crds.write();
+        let mut num_purged = 0;
+        for label in labels {
+            if crds.is_old_label(label, now, timeouts) {
+                crds.remove(label, now);
+                num_purged += 1;
+            }
+        }
+        num_purged
     }
 }
 
@@ -746,7 +781,8 @@ pub(crate) mod tests {
         super::*,
         crate::{
             cluster_info::{GOSSIP_PING_CACHE_OUTSTANDING_PING_TIMEOUT_MS, GOSSIP_PING_CACHE_TTL},
-            crds_data::CrdsData,
+            crds::Crds,
+            crds_data::{CrdsData, LowestSlot},
             protocol::Protocol,
         },
         itertools::Itertools,
@@ -1354,6 +1390,66 @@ pub(crate) mod tests {
         node_crds.trim_purged(node.crds_timeout + 1);
         assert_eq!(node_crds.num_purged(), 0);
     }
+    #[test]
+    fn test_purge_remove_batch_revalidates_active_record() {
+        let pubkey = Pubkey::new_unique();
+        let old = CrdsValue::new_unsigned(CrdsData::LowestSlot(0, LowestSlot::new(pubkey, 0, 0)));
+        let old_label = old.label();
+        let mut crds = Crds::default();
+        crds.insert(old, 0, GossipRoute::LocalMessage).unwrap();
+        let crds = parking_lot::RwLock::new(crds);
+        let stakes = HashMap::from([(Pubkey::new_unique(), 1u64)]);
+        let timeouts =
+            CrdsTimeouts::new(Pubkey::new_unique(), 1, Duration::from_millis(1), &stakes);
+
+        let candidates =
+            CrdsGossipPull::purge_find_candidates_batch(&crds, &[pubkey], 2, &timeouts);
+        assert_eq!(candidates, vec![old_label.clone()]);
+
+        let contact_info = ContactInfo::new_localhost(&pubkey, 2);
+        let contact_info = CrdsValue::new_unsigned(CrdsData::from(contact_info));
+        crds.write()
+            .unwrap()
+            .insert(contact_info, 2, GossipRoute::LocalMessage)
+            .unwrap();
+
+        assert_eq!(
+            CrdsGossipPull::purge_remove_batch(&crds, &candidates, 2, &timeouts),
+            0
+        );
+        assert!(crds.read().get::<&CrdsValue>(&old_label).is_some());
+    }
+
+    #[test]
+    fn test_gossip_purge_across_multiple_batches() {
+        let thread_pool = ThreadPoolBuilder::new().build().unwrap();
+        let self_pubkey = Pubkey::new_unique();
+        let self_value =
+            CrdsValue::new_unsigned(CrdsData::from(ContactInfo::new_localhost(&self_pubkey, 0)));
+        let self_label = self_value.label();
+        let mut crds = Crds::default();
+        crds.insert(self_value, 0, GossipRoute::LocalMessage)
+            .unwrap();
+        for _ in 0..2 * PURGE_BATCH_SIZE + 1 {
+            let pubkey = Pubkey::new_unique();
+            let value =
+                CrdsValue::new_unsigned(CrdsData::from(ContactInfo::new_localhost(&pubkey, 0)));
+            crds.insert(value, 0, GossipRoute::LocalMessage).unwrap();
+        }
+
+        let crds = parking_lot::RwLock::new(crds);
+        let pull = CrdsGossipPull::default();
+        let stakes = HashMap::from([(Pubkey::new_unique(), 1u64)]);
+        let timeouts = pull.make_timeouts(self_pubkey, &stakes, Duration::default());
+        let num_purged =
+            CrdsGossipPull::purge_active(&thread_pool, &crds, pull.crds_timeout, &timeouts);
+
+        assert_eq!(num_purged, 2 * PURGE_BATCH_SIZE + 1);
+        let crds = crds.read();
+        assert_eq!(crds.len(), 1);
+        assert!(crds.get::<&CrdsValue>(&self_label).is_some());
+    }
+
     #[test]
     fn test_crds_filter_mask() {
         let filter = CrdsFilter::new_rand(1, 128);

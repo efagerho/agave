@@ -775,44 +775,90 @@ impl Crds {
         now: u64,
         timeouts: &CrdsTimeouts,
     ) -> Vec<CrdsValueLabel> {
-        // Given an index of all crd values associated with a pubkey,
-        // returns crds labels of old values to be evicted.
-        let evict = |pubkey, index: &IndexSet<usize>| {
-            let timeout = timeouts[pubkey];
-            // If the origin's contact-info hasn't expired yet then preserve
-            // all associated values.
-            let origin = CrdsValueLabel::ContactInfo(*pubkey);
-            if let Some(origin) = self.table.get(&origin)
-                && origin
-                    .value
-                    .wallclock()
-                    .min(origin.local_timestamp)
-                    .saturating_add(timeout)
-                    > now
-            {
-                return vec![];
-            }
-            // Otherwise check each value's timestamp individually.
-            index
-                .into_iter()
-                .map(|&ix| self.table.get_index(ix).unwrap())
-                .filter(|(_, entry)| {
-                    entry
-                        .value
-                        .wallclock()
-                        .min(entry.local_timestamp)
-                        .saturating_add(timeout)
-                        <= now
-                })
-                .map(|(label, _)| label)
-                .cloned()
-                .collect::<Vec<_>>()
-        };
         thread_pool.install(|| {
             self.records
                 .par_iter()
-                .flat_map(|(pubkey, index)| evict(pubkey, index))
+                .flat_map_iter(|(pubkey, index)| {
+                    self.find_old_labels_for_record(pubkey, index, now, timeouts)
+                })
                 .collect()
+        })
+    }
+
+    pub(crate) fn record_pubkeys(&self) -> impl Iterator<Item = Pubkey> + '_ {
+        self.records.keys().copied()
+    }
+
+    pub(crate) fn find_old_labels_for_pubkeys(
+        &self,
+        pubkeys: &[Pubkey],
+        now: u64,
+        timeouts: &CrdsTimeouts,
+    ) -> Vec<CrdsValueLabel> {
+        pubkeys
+            .iter()
+            .filter_map(|pubkey| self.records.get(pubkey).map(|index| (pubkey, index)))
+            .flat_map(|(pubkey, index)| {
+                self.find_old_labels_for_record(pubkey, index, now, timeouts)
+            })
+            .collect()
+    }
+
+    pub(crate) fn is_old_label(
+        &self,
+        label: &CrdsValueLabel,
+        now: u64,
+        timeouts: &CrdsTimeouts,
+    ) -> bool {
+        let pubkey = label.pubkey();
+        if self.is_record_active(&pubkey, now, timeouts) {
+            return false;
+        }
+        let Some(entry) = self.table.get(label) else {
+            return false;
+        };
+        entry
+            .value
+            .wallclock()
+            .min(entry.local_timestamp)
+            .saturating_add(timeouts[&pubkey])
+            <= now
+    }
+
+    fn find_old_labels_for_record<'a>(
+        &'a self,
+        pubkey: &Pubkey,
+        index: &'a IndexSet<usize>,
+        now: u64,
+        timeouts: &CrdsTimeouts,
+    ) -> impl Iterator<Item = CrdsValueLabel> + 'a {
+        let inactive = !self.is_record_active(pubkey, now, timeouts);
+        let timeout = timeouts[pubkey];
+        inactive
+            .then_some(index)
+            .into_iter()
+            .flatten()
+            .map(move |&index| self.table.get_index(index).unwrap())
+            .filter(move |(_, entry)| {
+                entry
+                    .value
+                    .wallclock()
+                    .min(entry.local_timestamp)
+                    .saturating_add(timeout)
+                    <= now
+            })
+            .map(|(label, _)| label.clone())
+    }
+
+    fn is_record_active(&self, pubkey: &Pubkey, now: u64, timeouts: &CrdsTimeouts) -> bool {
+        let origin = CrdsValueLabel::ContactInfo(*pubkey);
+        self.table.get(&origin).is_some_and(|origin| {
+            origin
+                .value
+                .wallclock()
+                .min(origin.local_timestamp)
+                .saturating_add(timeouts[pubkey])
+                > now
         })
     }
 
