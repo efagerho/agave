@@ -222,14 +222,35 @@ impl CrdsFilterSet {
         Self { filters, mask_bits }
     }
 
-    fn add(&self, hash_value: Hash) {
+    #[inline]
+    fn hash_index(&self, hash_value: &Hash) -> usize {
         let shift = u64::BITS.checked_sub(self.mask_bits).unwrap();
-        let index = usize::try_from(
-            CrdsFilter::hash_as_u64(&hash_value)
+        usize::try_from(
+            CrdsFilter::hash_as_u64(hash_value)
                 .checked_shr(shift)
                 .unwrap_or_default(),
         )
-        .unwrap();
+        .unwrap()
+    }
+
+    fn active_masks(&self) -> impl Iterator<Item = u64> + '_ {
+        self.filters
+            .iter()
+            .enumerate()
+            .filter_map(|(seed, filter)| {
+                filter
+                    .as_ref()
+                    .map(|_| CrdsFilter::compute_mask(u64::try_from(seed).unwrap(), self.mask_bits))
+            })
+    }
+
+    #[inline]
+    fn contains_hash_prefix(&self, hash_value: &Hash) -> bool {
+        self.filters[self.hash_index(hash_value)].is_some()
+    }
+
+    fn add(&self, hash_value: Hash) {
+        let index = self.hash_index(&hash_value);
         if let Some(filter) = &self.filters[index] {
             filter.add(&hash_value);
         }
@@ -487,27 +508,32 @@ impl CrdsGossipPull {
         bloom_size: usize,
     ) -> Vec<CrdsFilter> {
         const PAR_MIN_LENGTH: usize = 512;
-        // Snapshot hashes so that the locks are not held while building the filters.
-        let hash_values: Vec<_> = {
-            let failed_inserts = self.failed_inserts.read().unwrap();
-            // crds should be locked last after self.failed_inserts.
+        // Counts are used only to size the filters, so they need not be read
+        // atomically with the subsequent snapshots.
+        let num_items = self.failed_inserts.read().unwrap().len();
+        let num_items = {
             let crds = crds.read();
-            thread_pool.install(|| {
-                crds.par_values()
-                    .with_min_len(PAR_MIN_LENGTH)
-                    .map(|v| *v.value.hash())
-                    .chain(crds.purged().with_min_len(PAR_MIN_LENGTH))
-                    .chain(
-                        failed_inserts
-                            .par_iter()
-                            .with_min_len(PAR_MIN_LENGTH)
-                            .map(|(v, _)| *v),
-                    )
-                    .collect()
-            })
+            num_items + crds.len() + crds.num_purged()
         };
-        let num_items = MIN_NUM_BLOOM_ITEMS.max(hash_values.len());
+        let num_items = MIN_NUM_BLOOM_ITEMS.max(num_items);
         let filters = CrdsFilterSet::new(&mut rand::rng(), num_items, bloom_size);
+
+        // Snapshot only prefixes that have active filters, releasing the read
+        // guard between disjoint prefixes. Bloom construction stays unlocked.
+        let mut hash_values = Vec::with_capacity(num_items.div_ceil(SAMPLE_RATE));
+        for mask in filters.active_masks() {
+            let crds = crds.read();
+            hash_values.extend(crds.filter_hashes(mask, filters.mask_bits));
+        }
+        {
+            let failed_inserts = self.failed_inserts.read().unwrap();
+            hash_values.extend(
+                failed_inserts
+                    .iter()
+                    .map(|(hash, _)| *hash)
+                    .filter(|hash| filters.contains_hash_prefix(hash)),
+            );
+        }
         thread_pool.install(|| {
             hash_values
                 .into_par_iter()
@@ -948,7 +974,7 @@ pub(crate) mod tests {
         );
         assert_eq!(filters.len(), MIN_NUM_BLOOM_FILTERS.max(4));
         let crds = crds.read();
-        let purged: Vec<_> = thread_pool.install(|| crds.purged().collect());
+        let purged: Vec<_> = crds.purged_hashes().collect();
         let hash_values: Vec<_> = crds
             .values()
             .map(|v| *v.value.hash())
