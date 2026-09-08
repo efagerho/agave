@@ -317,6 +317,18 @@ pub(crate) type GossipStakePubkey = (
     /* node pubkey */ Address,
 );
 
+type GossipNodeSnapshot = (
+    /* gossip */ Option<SocketAddr>,
+    /* shred version */ u16,
+    /* node pubkey */ Address,
+    /* local timestamp */ u64,
+);
+
+fn snapshot_gossip_nodes(crds: &RwLock<Crds>) -> Vec<GossipNodeSnapshot> {
+    let crds = crds.read();
+    crds.get_gossip_nodes().collect()
+}
+
 // Returns active and valid cluster nodes to gossip with.
 pub(crate) fn get_gossip_nodes<R: Rng>(
     rng: &mut R,
@@ -333,29 +345,27 @@ pub(crate) fn get_gossip_nodes<R: Rng>(
     // Exclude nodes which have not been active for this long.
     const ACTIVE_TIMEOUT: Duration = Duration::from_secs(60);
     let active_cutoff = now.saturating_sub(ACTIVE_TIMEOUT.as_millis() as u64);
-    let crds = crds.read();
-    crds.get_nodes()
-        .filter_map(|value| {
-            let node = value.value.contact_info()?;
-            let gossip = node.gossip().filter(|addr| socket_addr_space.check(addr))?;
-            let node_pubkey = node.pubkey();
-            if node_pubkey == pubkey
-                || !verify_shred_version(node.shred_version())
-                || gossip_validators.is_some_and(|nodes| !nodes.contains(node_pubkey))
+    snapshot_gossip_nodes(crds)
+        .into_iter()
+        .filter_map(|(gossip, shred_version, node_pubkey, local_timestamp)| {
+            let gossip = gossip.filter(|addr| socket_addr_space.check(addr))?;
+            if node_pubkey == *pubkey
+                || !verify_shred_version(shred_version)
+                || gossip_validators.is_some_and(|nodes| !nodes.contains(&node_pubkey))
             {
                 return None;
             }
 
-            let stake = stakes.get(node_pubkey).copied().unwrap_or_default();
+            let stake = stakes.get(&node_pubkey).copied().unwrap_or_default();
             // Exclude nodes which have not been active recently.
-            if value.local_timestamp < active_cutoff {
+            if local_timestamp < active_cutoff {
                 // In order to mitigate eclipse attack, for staked nodes
                 // continue retrying periodically.
                 if stake == 0u64 || !rng.random_ratio(1, 16) {
                     return None;
                 }
             }
-            Some((gossip, stake, *node_pubkey))
+            Some((gossip, stake, node_pubkey))
         })
         .collect()
 }

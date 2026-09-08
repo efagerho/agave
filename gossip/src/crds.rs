@@ -199,6 +199,9 @@ struct RepairPeerIndexEntry {
 struct RepairPeerContactInfo {
     tvu: Option<SocketAddr>,
     serve_repair: Option<SocketAddr>,
+    gossip: Option<SocketAddr>,
+    shred_version: u16,
+    local_timestamp: u64,
 }
 
 fn update_repair_peer_index(
@@ -211,6 +214,9 @@ fn update_repair_peer_index(
             entry.contact_info = Some(RepairPeerContactInfo {
                 tvu: node.tvu(Protocol::UDP),
                 serve_repair: node.serve_repair(Protocol::UDP),
+                gossip: node.gossip(),
+                shred_version: node.shred_version(),
+                local_timestamp: value.local_timestamp,
             });
         }
         CrdsData::LowestSlot(_, lowest_slot) => {
@@ -595,6 +601,20 @@ impl Crds {
         })
     }
 
+    pub(crate) fn get_gossip_nodes(
+        &self,
+    ) -> impl Iterator<Item = (Option<SocketAddr>, u16, Pubkey, u64)> + '_ {
+        self.repair_peers.iter().filter_map(|(pubkey, entry)| {
+            let contact_info = entry.contact_info?;
+            Some((
+                contact_info.gossip,
+                contact_info.shred_version,
+                *pubkey,
+                contact_info.local_timestamp,
+            ))
+        })
+    }
+
     /// Returns all vote entries inserted since the given cursor.
     /// Updates the cursor as the votes are consumed.
     pub(crate) fn get_votes<'a>(
@@ -752,6 +772,13 @@ impl Crds {
             Some(origin) => {
                 if origin.local_timestamp < now {
                     origin.local_timestamp = now;
+                    if let Some(contact_info) = self
+                        .repair_peers
+                        .get_mut(pubkey)
+                        .and_then(|entry| entry.contact_info.as_mut())
+                    {
+                        contact_info.local_timestamp = now;
+                    }
                 }
             }
             None => {
@@ -1202,11 +1229,17 @@ mod tests {
         let mut contact_info = ContactInfo::new_localhost(&pubkey, 1);
         let tvu = contact_info.tvu(Protocol::UDP);
         let serve_repair = contact_info.serve_repair(Protocol::UDP);
+        let gossip = contact_info.gossip();
+        let shred_version = contact_info.shred_version();
         let value = CrdsValue::new_unsigned(CrdsData::from(contact_info.clone()));
         assert_matches!(crds.insert(value, 1, GossipRoute::LocalMessage), Ok(()));
         assert_eq!(
             crds.get_repair_peers(5).collect::<Vec<_>>(),
             vec![(pubkey, tvu, serve_repair)]
+        );
+        assert_eq!(
+            crds.get_gossip_nodes().collect::<Vec<_>>(),
+            vec![(gossip, shred_version, pubkey, 1)]
         );
 
         let lowest_slot =
@@ -1232,13 +1265,23 @@ mod tests {
             crds.get_repair_peers(10).collect::<Vec<_>>(),
             vec![(pubkey, tvu, serve_repair)]
         );
+        crds.update_record_timestamp(&pubkey, 3);
+        assert_eq!(
+            crds.get_gossip_nodes().collect::<Vec<_>>(),
+            vec![(gossip, shred_version, pubkey, 3)]
+        );
 
         crds.remove(&CrdsValueLabel::ContactInfo(pubkey), 3);
         assert!(crds.get_repair_peers(10).next().is_none());
+        assert!(crds.get_gossip_nodes().next().is_none());
 
         let value = CrdsValue::new_unsigned(CrdsData::from(contact_info));
         assert_matches!(crds.insert(value, 4, GossipRoute::LocalMessage), Ok(()));
         assert!(crds.get_repair_peers(5).next().is_none());
+        assert_eq!(
+            crds.get_gossip_nodes().collect::<Vec<_>>(),
+            vec![(gossip, shred_version, pubkey, 4)]
+        );
 
         crds.remove(&CrdsValueLabel::LowestSlot(pubkey), 5);
         assert_eq!(
