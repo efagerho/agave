@@ -59,6 +59,7 @@ pub const CRDS_GOSSIP_PULL_CRDS_TIMEOUT_MS: u64 = 15000;
 pub const CRDS_GOSSIP_PURGE_DURATION: Duration = Duration::from_secs(2 * 24 * 60 * 60);
 // Retention period of hashes of received outdated values.
 const FAILED_INSERTS_RETENTION_MS: u64 = 20_000;
+const PULL_RESPONSE_FILTER_BATCH_SIZE: usize = 32;
 pub const FALSE_RATE: f64 = 0.1f64;
 pub const KEYS: f64 = 8f64;
 
@@ -269,6 +270,14 @@ pub struct CrdsGossipPull {
     pub num_pulls: AtomicUsize,
 }
 
+#[derive(Clone, Copy)]
+enum PullResponseDisposition {
+    Active,
+    Expired,
+    Failed,
+    FailedTimeout,
+}
+
 impl Default for CrdsGossipPull {
     fn default() -> Self {
         Self {
@@ -380,35 +389,56 @@ impl CrdsGossipPull {
     ) -> (Vec<CrdsValue>, Vec<CrdsValue>, Vec<Hash>) {
         let mut active_values = vec![];
         let mut expired_values = vec![];
+        let mut failed_inserts = vec![];
+        let mut pending = responses.into_iter();
+        let mut batch = Vec::with_capacity(PULL_RESPONSE_FILTER_BATCH_SIZE);
+        let mut dispositions = Vec::with_capacity(PULL_RESPONSE_FILTER_BATCH_SIZE);
+        loop {
+            batch.extend(pending.by_ref().take(PULL_RESPONSE_FILTER_BATCH_SIZE));
+            if batch.is_empty() {
+                break;
+            }
+            Self::filter_pull_responses_batch(crds, timeouts, &batch, now, &mut dispositions);
+            debug_assert_eq!(batch.len(), dispositions.len());
+            for (response, disposition) in batch.drain(..).zip(dispositions.drain(..)) {
+                match disposition {
+                    PullResponseDisposition::Active => active_values.push(response),
+                    PullResponseDisposition::Expired => expired_values.push(response),
+                    PullResponseDisposition::Failed => failed_inserts.push(*response.hash()),
+                    PullResponseDisposition::FailedTimeout => {
+                        stats.failed_timeout += 1;
+                        failed_inserts.push(*response.hash());
+                    }
+                }
+            }
+        }
+        (active_values, expired_values, failed_inserts)
+    }
+
+    fn filter_pull_responses_batch(
+        crds: &parking_lot::RwLock<Crds>,
+        timeouts: &CrdsTimeouts,
+        responses: &[CrdsValue],
+        now: u64,
+        dispositions: &mut Vec<PullResponseDisposition>,
+    ) {
+        debug_assert!(dispositions.is_empty());
         let crds = crds.read();
-        let upsert = |response: CrdsValue| {
+        dispositions.extend(responses.iter().map(|response| {
             let owner = response.label().pubkey();
-            // Check if the crds value is older than the msg_timeout
             let timeout = timeouts[&owner];
-            // Before discarding this value, check if a ContactInfo for the
-            // owner exists in the table. If it doesn't, that implies that this
-            // value can be discarded
-            if !crds.upserts(&response) {
-                Some(response)
+            if !crds.upserts(response) {
+                PullResponseDisposition::Failed
             } else if now <= response.wallclock().saturating_add(timeout) {
-                active_values.push(response);
-                None
+                PullResponseDisposition::Active
             } else if crds.get::<&ContactInfo>(owner).is_some() {
                 // Silently insert this old value without bumping record
-                // timestamps
-                expired_values.push(response);
-                None
+                // timestamps.
+                PullResponseDisposition::Expired
             } else {
-                stats.failed_timeout += 1;
-                Some(response)
+                PullResponseDisposition::FailedTimeout
             }
-        };
-        let failed_inserts = responses
-            .into_iter()
-            .filter_map(upsert)
-            .map(|resp| *resp.hash())
-            .collect();
-        (active_values, expired_values, failed_inserts)
+        }));
     }
 
     /// Process a vec of pull responses
@@ -1122,6 +1152,29 @@ pub(crate) mod tests {
         .filter(|peer| peer != old)
         .count();
         assert!(count < 75, "count of peer != old: {count}");
+    }
+
+    #[test]
+    fn test_filter_pull_responses_across_batches() {
+        let node = CrdsGossipPull::default();
+        let node_crds = parking_lot::RwLock::default();
+        let stakes = HashMap::new();
+        let timeouts = node.make_timeouts(Pubkey::new_unique(), &stakes, Duration::default());
+        let responses: Vec<_> = (0..2 * PULL_RESPONSE_FILTER_BATCH_SIZE + 1)
+            .map(|_| {
+                CrdsValue::new_unsigned(CrdsData::from(ContactInfo::new_localhost(
+                    &Pubkey::new_unique(),
+                    0,
+                )))
+            })
+            .collect();
+        let mut stats = ProcessPullStats::default();
+        let (active, expired, failed) =
+            node.filter_pull_responses(&node_crds, &timeouts, responses.clone(), 0, &mut stats);
+        assert_eq!(active, responses);
+        assert!(expired.is_empty());
+        assert!(failed.is_empty());
+        assert_eq!(stats.failed_timeout, 0);
     }
 
     #[test]
