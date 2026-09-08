@@ -28,7 +28,7 @@
 use {
     crate::{
         cluster_info_metrics::{last_four_chars, should_report_message_signature},
-        contact_info::ContactInfo,
+        contact_info::{ContactInfo, Protocol},
         contact_info_notifier::{ContactInfoEvent, ContactInfoSender, ContactInfoSnapshot},
         crds_data::CrdsData,
         crds_entry::CrdsEntry,
@@ -50,6 +50,7 @@ use {
     std::{
         cmp::Ordering,
         collections::{BTreeMap, HashMap, HashSet, VecDeque, hash_map},
+        net::SocketAddr,
         ops::{Bound, Index, IndexMut},
         sync::Mutex,
     },
@@ -188,12 +189,72 @@ where
         }
     }
 }
+#[derive(Clone, Copy, Default)]
+struct RepairPeerIndexEntry {
+    contact_info: Option<RepairPeerContactInfo>,
+    lowest_slot: Option<Slot>,
+}
+
+#[derive(Clone, Copy)]
+struct RepairPeerContactInfo {
+    tvu: Option<SocketAddr>,
+    serve_repair: Option<SocketAddr>,
+}
+
+fn update_repair_peer_index(
+    repair_peers: &mut IndexMap<Pubkey, RepairPeerIndexEntry>,
+    value: &VersionedCrdsValue,
+) {
+    match value.value.data() {
+        CrdsData::ContactInfo(node) => {
+            let entry = repair_peers.entry(*node.pubkey()).or_default();
+            entry.contact_info = Some(RepairPeerContactInfo {
+                tvu: node.tvu(Protocol::UDP),
+                serve_repair: node.serve_repair(Protocol::UDP),
+            });
+        }
+        CrdsData::LowestSlot(_, lowest_slot) => {
+            repair_peers
+                .entry(lowest_slot.from)
+                .or_default()
+                .lowest_slot = Some(lowest_slot.lowest);
+        }
+        _ => {}
+    }
+}
+
+fn remove_from_repair_peer_index(
+    repair_peers: &mut IndexMap<Pubkey, RepairPeerIndexEntry>,
+    value: &CrdsData,
+) {
+    let (pubkey, is_contact_info) = match value {
+        CrdsData::ContactInfo(node) => (*node.pubkey(), true),
+        CrdsData::LowestSlot(_, lowest_slot) => (lowest_slot.from, false),
+        _ => return,
+    };
+    let remove_entry = if let Some(entry) = repair_peers.get_mut(&pubkey) {
+        if is_contact_info {
+            entry.contact_info = None;
+        } else {
+            entry.lowest_slot = None;
+        }
+        entry.contact_info.is_none() && entry.lowest_slot.is_none()
+    } else {
+        debug_assert!(false, "repair-peer index is missing {pubkey}");
+        false
+    };
+    if remove_entry {
+        repair_peers.swap_remove(&pubkey);
+    }
+}
+
 pub struct Crds {
     /// Stores the map of labels and values
     table: IndexMap<CrdsValueLabel, VersionedCrdsValue>,
     cursor: Cursor, // Next insert ordinal location.
     shards: CrdsShards,
     nodes: IndexSet<usize>, // Indices of nodes' ContactInfo.
+    repair_peers: IndexMap<Pubkey, RepairPeerIndexEntry>,
     // Indices of Votes keyed by insert order.
     votes: BTreeMap<u64 /*insert order*/, usize /*index*/>,
     // Indices of EpochSlots keyed by insert order.
@@ -301,6 +362,7 @@ impl Default for Crds {
             cursor: Cursor::default(),
             shards: CrdsShards::new(CRDS_SHARDS_BITS),
             nodes: IndexSet::default(),
+            repair_peers: IndexMap::default(),
             votes: BTreeMap::default(),
             epoch_slots: BTreeMap::default(),
             duplicate_shreds: BTreeMap::default(),
@@ -397,6 +459,7 @@ impl Crds {
                 stats.record_insert(&value, route);
                 let entry_index = entry.index();
                 self.shards.insert(entry_index, &value);
+                update_repair_peer_index(&mut self.repair_peers, &value);
                 match value.value.data() {
                     CrdsData::ContactInfo(node) => {
                         self.nodes.insert(entry_index);
@@ -427,6 +490,7 @@ impl Crds {
                 let entry_index = entry.index();
                 self.shards.remove(entry_index, entry.get());
                 self.shards.insert(entry_index, &value);
+                update_repair_peer_index(&mut self.repair_peers, &value);
                 match value.value.data() {
                     CrdsData::ContactInfo(node) => {
                         // self.nodes does not need to be updated since the
@@ -512,6 +576,22 @@ impl Crds {
         self.get_nodes().map(|v| match v.value.data() {
             CrdsData::ContactInfo(info) => info,
             _ => panic!("this should not happen!"),
+        })
+    }
+
+    pub(crate) fn get_repair_peers(
+        &self,
+        slot: Slot,
+    ) -> impl Iterator<Item = (Pubkey, Option<SocketAddr>, Option<SocketAddr>)> + '_ {
+        self.repair_peers.iter().filter_map(move |(pubkey, entry)| {
+            let contact_info = entry.contact_info?;
+            if entry
+                .lowest_slot
+                .is_some_and(|lowest_slot| lowest_slot > slot)
+            {
+                return None;
+            }
+            Some((*pubkey, contact_info.tvu, contact_info.serve_repair))
         })
     }
 
@@ -742,6 +822,7 @@ impl Crds {
         };
         self.purged.push_back((*value.value.hash(), now));
         self.shards.remove(index, &value);
+        remove_from_repair_peer_index(&mut self.repair_peers, value.value.data());
         match value.value.data() {
             CrdsData::ContactInfo(node) => {
                 self.nodes.swap_remove(&index);
@@ -1066,6 +1147,58 @@ mod tests {
         assert_eq!(crds.table.len(), 1);
         assert!(crds.table.contains_key(&val.label()));
         assert_eq!(crds.table[&val.label()].local_timestamp, 0);
+    }
+
+    #[test]
+    fn test_repair_peer_index_tracks_insert_update_and_remove() {
+        let mut crds = Crds::default();
+        let pubkey = Pubkey::new_unique();
+        let mut contact_info = ContactInfo::new_localhost(&pubkey, 1);
+        let tvu = contact_info.tvu(Protocol::UDP);
+        let serve_repair = contact_info.serve_repair(Protocol::UDP);
+        let value = CrdsValue::new_unsigned(CrdsData::from(contact_info.clone()));
+        assert_matches!(crds.insert(value, 1, GossipRoute::LocalMessage), Ok(()));
+        assert_eq!(
+            crds.get_repair_peers(5).collect::<Vec<_>>(),
+            vec![(pubkey, tvu, serve_repair)]
+        );
+
+        let lowest_slot =
+            CrdsValue::new_unsigned(CrdsData::LowestSlot(0, LowestSlot::new(pubkey, 10, 1)));
+        assert_matches!(
+            crds.insert(lowest_slot, 1, GossipRoute::LocalMessage),
+            Ok(())
+        );
+        assert!(crds.get_repair_peers(5).next().is_none());
+        assert_eq!(
+            crds.get_repair_peers(10).collect::<Vec<_>>(),
+            vec![(pubkey, tvu, serve_repair)]
+        );
+
+        contact_info
+            .set_serve_repair(Protocol::UDP, (Ipv4Addr::LOCALHOST, 9000))
+            .unwrap();
+        contact_info.set_wallclock(2);
+        let serve_repair = contact_info.serve_repair(Protocol::UDP);
+        let value = CrdsValue::new_unsigned(CrdsData::from(contact_info.clone()));
+        assert_matches!(crds.insert(value, 2, GossipRoute::LocalMessage), Ok(()));
+        assert_eq!(
+            crds.get_repair_peers(10).collect::<Vec<_>>(),
+            vec![(pubkey, tvu, serve_repair)]
+        );
+
+        crds.remove(&CrdsValueLabel::ContactInfo(pubkey), 3);
+        assert!(crds.get_repair_peers(10).next().is_none());
+
+        let value = CrdsValue::new_unsigned(CrdsData::from(contact_info));
+        assert_matches!(crds.insert(value, 4, GossipRoute::LocalMessage), Ok(()));
+        assert!(crds.get_repair_peers(5).next().is_none());
+
+        crds.remove(&CrdsValueLabel::LowestSlot(pubkey), 5);
+        assert_eq!(
+            crds.get_repair_peers(5).collect::<Vec<_>>(),
+            vec![(pubkey, tvu, serve_repair)]
+        );
     }
 
     #[test]

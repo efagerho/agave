@@ -28,7 +28,7 @@ use {
     },
     solana_clock::Slot,
     solana_gossip::{
-        cluster_info::{ClusterInfo, ClusterInfoError},
+        cluster_info::{ClusterInfo, ClusterInfoError, RepairPeer},
         contact_info::{ContactInfo, Protocol},
         ping_pong::{self, Pong},
         weighted_shuffle::WeightedShuffle,
@@ -705,7 +705,7 @@ pub struct ServeRepair {
 pub(crate) struct RepairPeers {
     asof: Instant,
     weight_source: RepairPeerWeightSource,
-    peers: Vec<Node>,
+    peers: Vec<RepairPeer>,
     weighted_index: WeightedIndex<u64>,
 }
 
@@ -715,45 +715,29 @@ enum RepairPeerWeightSource {
     CurrentEpochStake,
 }
 
-struct Node {
-    pubkey: Pubkey,
-    serve_repair: SocketAddr,
-}
-
 impl RepairPeers {
     fn new(
         asof: Instant,
         weight_source: RepairPeerWeightSource,
-        peers: &[ContactInfo],
+        peers: &[RepairPeer],
         weights: &[u64],
     ) -> Result<Self> {
         if peers.len() != weights.len() {
             return Err(Error::from(WeightedError::InvalidWeight));
         }
-        let (peers, weights): (Vec<_>, Vec<u64>) = peers
-            .iter()
-            .zip(weights)
-            .filter_map(|(peer, &weight)| {
-                let node = Node {
-                    pubkey: *peer.pubkey(),
-                    serve_repair: peer.serve_repair(Protocol::UDP)?,
-                };
-                Some((node, weight))
-            })
-            .unzip();
         if peers.is_empty() {
             return Err(Error::from(ClusterInfoError::NoPeers));
         }
-        let weighted_index = WeightedIndex::new(weights)?;
+        let weighted_index = WeightedIndex::new(weights.to_vec())?;
         Ok(Self {
             asof,
             weight_source,
-            peers,
+            peers: peers.to_vec(),
             weighted_index,
         })
     }
 
-    fn sample<R: Rng>(&self, rng: &mut R) -> &Node {
+    fn sample<R: Rng>(&self, rng: &mut R) -> &RepairPeer {
         let index = self.weighted_index.sample(rng);
         &self.peers[index]
     }
@@ -831,7 +815,7 @@ impl ServeRepair {
     }
 
     fn stake_weighted_repair_peer_weights(
-        repair_peers: &[ContactInfo],
+        repair_peers: &[RepairPeer],
         staked_nodes: &HashMap<Pubkey, u64>,
     ) -> Vec<u64> {
         repair_peers
@@ -844,7 +828,7 @@ impl ServeRepair {
         &self,
         slot: Slot,
         cluster_slots: &ClusterSlots,
-        repair_peers: &[ContactInfo],
+        repair_peers: &[RepairPeer],
         weight_source: RepairPeerWeightSource,
     ) -> Vec<u64> {
         match weight_source {
@@ -1720,7 +1704,7 @@ impl ServeRepair {
         );
         let out = self.map_repair_request(
             &repair_request,
-            &peer.pubkey,
+            peer.pubkey(),
             repair_stats,
             nonce,
             &identity_keypair,
@@ -1728,10 +1712,10 @@ impl ServeRepair {
         debug!(
             "Sending repair request from {} to {} for {:#?}",
             identity_keypair.pubkey(),
-            peer.pubkey,
+            peer.pubkey(),
             repair_request
         );
-        Ok(Some((peer.serve_repair, out)))
+        Ok(Some((peer.serve_repair(), out)))
     }
 
     /// [`Self::repair_request`] but for [`BlockIdRepairType`] requests
@@ -1759,17 +1743,17 @@ impl ServeRepair {
 
         let out = self.map_block_id_repair_request(
             &repair_request,
-            &peer.pubkey,
+            peer.pubkey(),
             nonce,
             &identity_keypair,
         )?;
         debug!(
             "Sending block_id repair request from {} to {} for {:#?}",
             identity_keypair.pubkey(),
-            peer.pubkey,
+            peer.pubkey(),
             repair_request
         );
-        Ok((out, peer.serve_repair, peer.pubkey))
+        Ok((out, peer.serve_repair(), *peer.pubkey()))
     }
 
     pub(crate) fn repair_request_ancestor_hashes_sample_peers(
@@ -1777,7 +1761,6 @@ impl ServeRepair {
         slot: Slot,
         cluster_slots: &ClusterSlots,
         repair_validators: &Option<HashSet<Pubkey>>,
-        repair_protocol: Protocol,
         my_pubkey: &Pubkey,
     ) -> Result<Vec<(Pubkey, SocketAddr)>> {
         let repair_peers: Vec<_> = self.repair_peers(repair_validators, slot, my_pubkey);
@@ -1788,10 +1771,7 @@ impl ServeRepair {
         let peers = WeightedShuffle::new("repair_request_ancestor_hashes", weights)
             .shuffle(&mut rand::rng())
             .map(|i| index[i])
-            .filter_map(|i| {
-                let addr = repair_peers[i].serve_repair(repair_protocol)?;
-                Some((*repair_peers[i].pubkey(), addr))
-            })
+            .map(|i| (*repair_peers[i].pubkey(), repair_peers[i].serve_repair()))
             .take(get_ancestor_hash_repair_sample_size())
             .collect();
         Ok(peers)
@@ -1812,10 +1792,7 @@ impl ServeRepair {
         let (weights, index) = cluster_slots.compute_weights_exclude_nonfrozen(slot, &repair_peers);
         let k = WeightedIndex::new(weights).ok()?.sample(&mut rand::rng());
         let n = index[k];
-        Some((
-            *repair_peers[n].pubkey(),
-            repair_peers[n].serve_repair(Protocol::UDP)?,
-        ))
+        Some((*repair_peers[n].pubkey(), repair_peers[n].serve_repair()))
     }
 
     pub(crate) fn map_repair_request(
@@ -1979,20 +1956,23 @@ impl ServeRepair {
         repair_validators: &Option<HashSet<Pubkey>>,
         slot: Slot,
         my_pubkey: &Pubkey,
-    ) -> Vec<ContactInfo> {
+    ) -> Vec<RepairPeer> {
         if let Some(repair_validators) = repair_validators {
             repair_validators
                 .iter()
                 .filter_map(|key| {
                     if key != my_pubkey {
-                        self.cluster_info.lookup_contact_info(key, |ci| ci.clone())
+                        self.cluster_info
+                            .lookup_contact_info(key, |ci| ci.serve_repair(Protocol::UDP))
+                            .flatten()
+                            .map(|addr| RepairPeer::new(*key, addr))
                     } else {
                         None
                     }
                 })
                 .collect()
         } else {
-            self.cluster_info.repair_peers(slot)
+            self.cluster_info.repair_peer_endpoints(slot)
         }
     }
 }
@@ -2945,8 +2925,8 @@ mod tests {
             (unstaked_pubkey, validator_stake.saturating_add(1)),
         ]));
         let repair_peers = vec![
-            ContactInfo::new_localhost(&validator_pubkey, timestamp()),
-            ContactInfo::new_localhost(&unstaked_pubkey, timestamp()),
+            RepairPeer::new(validator_pubkey, ([0, 0, 0, 0], 0).into()),
+            RepairPeer::new(unstaked_pubkey, ([0, 0, 0, 0], 0).into()),
         ];
         assert_ne!(
             cluster_slots.compute_weights(slot, &repair_peers),

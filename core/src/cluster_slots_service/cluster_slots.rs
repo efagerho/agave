@@ -8,7 +8,9 @@ use {
     solana_clock::{Epoch, Slot},
     solana_epoch_schedule::EpochSchedule,
     solana_gossip::{
-        cluster_info::ClusterInfo, contact_info::ContactInfo, crds::Cursor, epoch_slots::EpochSlots,
+        cluster_info::{ClusterInfo, RepairPeer},
+        crds::Cursor,
+        epoch_slots::EpochSlots,
     },
     solana_pubkey::Pubkey,
     solana_runtime::{bank::Bank, epoch_stakes::VersionedEpochStakes},
@@ -451,7 +453,7 @@ impl ClusterSlots {
         self.update_internal(current_root, vec![epoch_slot]);
     }
 
-    pub(crate) fn compute_weights(&self, slot: Slot, repair_peers: &[ContactInfo]) -> Vec<u64> {
+    pub(crate) fn compute_weights(&self, slot: Slot, repair_peers: &[RepairPeer]) -> Vec<u64> {
         if repair_peers.is_empty() {
             return vec![];
         }
@@ -493,7 +495,7 @@ impl ClusterSlots {
     pub(crate) fn compute_weights_exclude_nonfrozen(
         &self,
         slot: Slot,
-        repair_peers: &[ContactInfo],
+        repair_peers: &[RepairPeer],
     ) -> (Vec<u64>, Vec<usize>) {
         let Some(slot_peers) = self.lookup(slot) else {
             return (vec![], vec![]);
@@ -678,13 +680,13 @@ mod tests {
     #[test]
     fn test_compute_weights_failsafes() {
         let cs = ClusterSlots::default();
-        let ci = ContactInfo::default();
-        assert_eq!(cs.compute_weights(0, &[ci]), vec![1]);
+        let peer = RepairPeer::new(Pubkey::default(), ([0, 0, 0, 0], 0).into());
+        assert_eq!(cs.compute_weights(0, &[peer]), vec![1]);
 
         let (_, _, validator_stakes) = fake_stakes();
         cs.fake_epoch_info_for_tests(validator_stakes);
-        let ci = ContactInfo::default();
-        assert_eq!(cs.compute_weights(0, &[ci]), vec![1]);
+        let peer = RepairPeer::new(Pubkey::default(), ([0, 0, 0, 0], 0).into());
+        assert_eq!(cs.compute_weights(0, &[peer]), vec![1]);
     }
 
     #[test]
@@ -710,11 +712,11 @@ mod tests {
         epoch_slot2.fill(&[1, 2, 3, 4], 0);
         // both peers have slot 1 confirmed
         cs.update_internal(1, vec![epoch_slot1, epoch_slot2]);
-        let ci1 = ContactInfo::new(pk1, /*wallclock:*/ 0, /*shred_version:*/ 0);
-        let ci2 = ContactInfo::new(pk2, /*wallclock:*/ 0, /*shred_version:*/ 0);
+        let peer1 = RepairPeer::new(pk1, ([0, 0, 0, 0], 0).into());
+        let peer2 = RepairPeer::new(pk2, ([0, 0, 0, 0], 0).into());
 
         assert_eq!(
-            cs.compute_weights(1, &[ci1, ci2]),
+            cs.compute_weights(1, &[peer1, peer2]),
             vec![1000, 10],
             "weights should match the stakes"
         );
@@ -738,10 +740,10 @@ mod tests {
         epoch_slot.fill(&[1, 2, 3, 4], 0);
         // neither pk1 or pk2 has any confirmed slots
         cs.update_internal(0, vec![epoch_slot]);
-        let c1 = ContactInfo::new(pk1, /*wallclock:*/ 0, /*shred_version:*/ 0);
-        let c2 = ContactInfo::new(pk2, /*wallclock:*/ 0, /*shred_version:*/ 0);
+        let peer1 = RepairPeer::new(pk1, ([0, 0, 0, 0], 0).into());
+        let peer2 = RepairPeer::new(pk2, ([0, 0, 0, 0], 0).into());
         assert_eq!(
-            cs.compute_weights(1, &[c1, c2]),
+            cs.compute_weights(1, &[peer1, peer2]),
             vec![42 / 2, 1],
             "weights should be halved, but never zero"
         );
@@ -750,12 +752,8 @@ mod tests {
     #[test]
     fn test_best_completed_slot_peer() {
         let cs = ClusterSlots::default();
-        let contact_infos: Vec<_> = std::iter::repeat_with(|| {
-            ContactInfo::new(
-                Pubkey::new_unique(),
-                0, // wallclock
-                0, // shred_version
-            )
+        let repair_peers: Vec<_> = std::iter::repeat_with(|| {
+            RepairPeer::new(Pubkey::new_unique(), ([0, 0, 0, 0], 0).into())
         })
         .take(2)
         .collect();
@@ -763,14 +761,14 @@ mod tests {
 
         // None of these validators have completed slot 9, so should
         // return nothing
-        let (w, i) = cs.compute_weights_exclude_nonfrozen(slot, &contact_infos);
+        let (w, i) = cs.compute_weights_exclude_nonfrozen(slot, &repair_peers);
         assert!(w.is_empty());
         assert!(i.is_empty());
 
         // Give second validator max stake
         let validator_stakes: HashMap<_, _> = [
-            (*contact_infos[0].pubkey(), 42),
-            (*contact_infos[1].pubkey(), u64::MAX / 2),
+            (*repair_peers[0].pubkey(), 42),
+            (*repair_peers[1].pubkey(), u64::MAX / 2),
         ]
         .into_iter()
         .collect();
@@ -779,8 +777,8 @@ mod tests {
         // Mark the first validator as completed slot 9, should pick that validator,
         // even though it only has minimal stake, while the other validator has
         // max stake
-        cs.insert_node_id(slot, *contact_infos[0].pubkey());
-        let (w, i) = cs.compute_weights_exclude_nonfrozen(slot, &contact_infos);
+        cs.insert_node_id(slot, *repair_peers[0].pubkey());
+        let (w, i) = cs.compute_weights_exclude_nonfrozen(slot, &repair_peers);
         assert_eq!(w, [42]);
         assert_eq!(i, [0]);
     }

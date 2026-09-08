@@ -19,7 +19,7 @@ use {
     crossbeam_channel::{Receiver, RecvTimeoutError, Sender, TrySendError, bounded},
     dashmap::{DashMap, mapref::entry::Entry::Occupied},
     solana_clock::Slot,
-    solana_gossip::{contact_info::Protocol, ping_pong::Pong},
+    solana_gossip::ping_pong::Pong,
     solana_keypair::{Keypair, Signer, signable::Signable},
     solana_ledger::blockstore::Blockstore,
     solana_perf::{
@@ -837,7 +837,6 @@ impl AncestorHashesService {
             duplicate_slot,
             cluster_slots,
             repair_validators,
-            Protocol::UDP,
             &identity_keypair.pubkey(),
         ) else {
             return false;

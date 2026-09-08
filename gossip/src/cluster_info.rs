@@ -174,6 +174,29 @@ pub enum ClusterInfoError {
     TooManyIncrementalSnapshotHashes,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RepairPeer {
+    pubkey: Pubkey,
+    serve_repair: SocketAddr,
+}
+
+impl RepairPeer {
+    pub fn new(pubkey: Pubkey, serve_repair: SocketAddr) -> Self {
+        Self {
+            pubkey,
+            serve_repair,
+        }
+    }
+
+    pub fn pubkey(&self) -> &Pubkey {
+        &self.pubkey
+    }
+
+    pub fn serve_repair(&self) -> SocketAddr {
+        self.serve_repair
+    }
+}
+
 pub struct ClusterInfo {
     /// The network
     pub gossip: CrdsGossip,
@@ -1183,6 +1206,29 @@ impl ClusterInfo {
                     }
             })
             .cloned()
+            .collect()
+    }
+
+    /// Compact repair peer endpoints for latency-sensitive validator internals.
+    #[doc(hidden)]
+    pub fn repair_peer_endpoints(&self, slot: Slot) -> Vec<RepairPeer> {
+        let _st = ScopedTimer::from(&self.stats.repair_peers);
+        let self_pubkey = self.id();
+        let peers: Vec<_> = {
+            let gossip_crds = self.gossip.crds.read();
+            gossip_crds
+                .get_repair_peers(slot)
+                .filter(|(pubkey, _, _)| *pubkey != self_pubkey)
+                .collect()
+        };
+        peers
+            .into_iter()
+            .filter_map(|(pubkey, tvu, serve_repair)| {
+                let tvu = tvu?;
+                let serve_repair = serve_repair?;
+                (self.socket_addr_space.check(&tvu) && self.socket_addr_space.check(&serve_repair))
+                    .then_some(RepairPeer::new(pubkey, serve_repair))
+            })
             .collect()
     }
 
@@ -3695,6 +3741,7 @@ mod tests {
         }
         // only half the visible peers should be eligible to serve this repair
         assert_eq!(cluster_info.repair_peers(5).len(), 5);
+        assert_eq!(cluster_info.repair_peer_endpoints(5).len(), 5);
     }
 
     #[test]
