@@ -17,9 +17,10 @@ use {
     crate::{
         cluster_info_metrics::GossipStats,
         contact_info::ContactInfo,
-        crds::{Crds, GossipRoute, VersionedCrdsValue},
+        crds::{GossipRoute, VersionedCrdsValue},
         crds_gossip,
         crds_gossip_error::CrdsGossipError,
+        crds_rwlock::CrdsRwLock,
         crds_value::CrdsValue,
         protocol::{Ping, PingCache},
     },
@@ -284,7 +285,7 @@ impl CrdsGossipPull {
     pub(crate) fn new_pull_request(
         &self,
         thread_pool: &ThreadPool,
-        crds: &RwLock<Crds>,
+        crds: &CrdsRwLock,
         self_keypair: &Keypair,
         self_shred_version: u16,
         now: u64,
@@ -345,7 +346,7 @@ impl CrdsGossipPull {
 
     /// Create gossip responses to pull requests
     pub(crate) fn generate_pull_responses(
-        crds: &RwLock<Crds>,
+        crds: &CrdsRwLock,
         requests: &[PullRequest],
         output_size_limit: usize, // Limit number of crds values returned.
         now: u64,
@@ -372,7 +373,7 @@ impl CrdsGossipPull {
     //  .2 => hash value of outdated values which will fail to insert.
     pub(crate) fn filter_pull_responses(
         &self,
-        crds: &RwLock<Crds>,
+        crds: &CrdsRwLock,
         timeouts: &CrdsTimeouts,
         responses: Vec<CrdsValue>,
         now: u64,
@@ -414,7 +415,7 @@ impl CrdsGossipPull {
     /// Process a vec of pull responses
     pub(crate) fn process_pull_responses(
         &self,
-        crds: &RwLock<Crds>,
+        crds: &CrdsRwLock,
         responses: Vec<CrdsValue>,
         responses_expired_timeout: Vec<CrdsValue>,
         failed_inserts: Vec<Hash>,
@@ -467,7 +468,7 @@ impl CrdsGossipPull {
     pub fn build_crds_filters(
         &self,
         thread_pool: &ThreadPool,
-        crds: &RwLock<Crds>,
+        crds: &CrdsRwLock,
         bloom_size: usize,
     ) -> Vec<CrdsFilter> {
         const PAR_MIN_LENGTH: usize = 512;
@@ -503,7 +504,7 @@ impl CrdsGossipPull {
 
     /// Filter values that fail the bloom filter up to `max_bytes`.
     fn filter_crds_values(
-        crds: &RwLock<Crds>,
+        crds: &CrdsRwLock,
         requests: &[PullRequest],
         mut output_size_limit: usize, // Limit number of crds values returned.
         now: u64,
@@ -580,7 +581,7 @@ impl CrdsGossipPull {
     /// Purge values from the crds that are older then `active_timeout`
     pub(crate) fn purge_active(
         thread_pool: &ThreadPool,
-        crds: &RwLock<Crds>,
+        crds: &CrdsRwLock,
         now: u64,
         timeouts: &CrdsTimeouts,
     ) -> usize {
@@ -689,6 +690,7 @@ pub(crate) mod tests {
         super::*,
         crate::{
             cluster_info::{GOSSIP_PING_CACHE_OUTSTANDING_PING_TIMEOUT_MS, GOSSIP_PING_CACHE_TTL},
+            crds::Crds,
             crds_data::CrdsData,
             protocol::Protocol,
         },
@@ -715,7 +717,7 @@ pub(crate) mod tests {
         fn old_pull_request(
             &self,
             thread_pool: &ThreadPool,
-            crds: &RwLock<Crds>,
+            crds: &CrdsRwLock,
             self_keypair: &Keypair,
             self_shred_version: u16,
             now: u64,
@@ -924,7 +926,7 @@ pub(crate) mod tests {
                 num_inserts += 1;
             }
         }
-        let crds = RwLock::new(crds);
+        let crds = CrdsRwLock::new(crds);
         assert!(num_inserts > 30_000, "num inserts: {num_inserts}");
         let filters = crds_gossip_pull.build_crds_filters(
             &thread_pool,
@@ -969,7 +971,7 @@ pub(crate) mod tests {
     #[test]
     fn test_new_pull_request() {
         let thread_pool = ThreadPoolBuilder::new().build().unwrap();
-        let crds = RwLock::<Crds>::default();
+        let crds = CrdsRwLock::default();
         let node_keypair = Keypair::new();
         let entry = CrdsValue::new_unsigned(CrdsData::from(ContactInfo::new_localhost(
             &node_keypair.pubkey(),
@@ -1093,7 +1095,7 @@ pub(crate) mod tests {
         ping_cache.mock_pong(*new.pubkey(), new.gossip().unwrap(), Instant::now());
         let new = CrdsValue::new_unsigned(CrdsData::from(new));
         crds.insert(new, now, GossipRoute::LocalMessage).unwrap();
-        let crds = RwLock::new(crds);
+        let crds = CrdsRwLock::new(crds);
 
         // set request creation time to now.
         let now = now + 50_000;
@@ -1136,7 +1138,7 @@ pub(crate) mod tests {
             &solana_pubkey::new_rand(),
             new_wallclock,
         )));
-        let dest_crds = RwLock::<Crds>::default();
+        let dest_crds = CrdsRwLock::default();
         dest_crds
             .write()
             .unwrap()
@@ -1199,7 +1201,7 @@ pub(crate) mod tests {
             let entry: &VersionedCrdsValue = node_crds.get(&same_key.label()).unwrap();
             entry.local_timestamp
         });
-        let node_crds = RwLock::new(node_crds);
+        let node_crds = CrdsRwLock::new(node_crds);
         let stakes = HashMap::new();
         let timeouts = node.make_timeouts(node_pubkey, &stakes, Duration::default());
         let mut stats = ProcessPullStats::default();
@@ -1254,7 +1256,7 @@ pub(crate) mod tests {
             node_label
         );
         // purge
-        let node_crds = RwLock::new(node_crds);
+        let node_crds = CrdsRwLock::new(node_crds);
         let stakes = HashMap::from([(Pubkey::new_unique(), 1u64)]);
         let timeouts = node.make_timeouts(node_pubkey, &stakes, Duration::default());
         CrdsGossipPull::purge_active(&thread_pool, &node_crds, node.crds_timeout, &timeouts);

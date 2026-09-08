@@ -5,10 +5,10 @@ use {
     solana_gossip::{
         crds::{Crds, GossipRoute},
         crds_gossip_pull::{CrdsFilter, CrdsGossipPull},
+        crds_rwlock::CrdsRwLock,
         crds_value::CrdsValue,
     },
     solana_hash::Hash,
-    std::sync::RwLock,
 };
 
 fn bench_hash_as_u64(c: &mut Criterion) {
@@ -41,7 +41,7 @@ fn bench_build_crds_filters(c: &mut Criterion) {
         })
         .count();
     assert_eq!(num_inserts, 90_000);
-    let crds = RwLock::new(crds);
+    let crds = CrdsRwLock::new(crds);
     c.bench_function("bench_build_crds_filters", |b| {
         b.iter(|| {
             let filters = crds_gossip_pull.build_crds_filters(

@@ -26,6 +26,7 @@ use {
             self, CRDS_GOSSIP_PULL_CRDS_TIMEOUT_MS, CRDS_GOSSIP_PURGE_DURATION, CrdsFilter,
             CrdsTimeouts, ProcessPullStats, PullRequest, get_max_bloom_filter_bytes,
         },
+        crds_rwlock::CrdsReadGuard,
         crds_value::{CrdsValue, CrdsValueLabel},
         duplicate_shred::DuplicateShred,
         epoch_slots::EpochSlots,
@@ -87,7 +88,7 @@ use {
         rc::Rc,
         result::Result,
         sync::{
-            Arc, Mutex, OnceLock, RwLock, RwLockReadGuard,
+            Arc, Mutex, OnceLock, RwLock,
             atomic::{AtomicBool, Ordering},
         },
         thread::{Builder, JoinHandle, sleep},
@@ -859,7 +860,7 @@ impl ClusterInfo {
         &'a self,
         label: &'static str,
         counter: &'a Counter,
-    ) -> TimedGuard<'a, RwLockReadGuard<'a, Crds>> {
+    ) -> TimedGuard<'a, CrdsReadGuard<'a>> {
         TimedGuard::new(self.gossip.crds.read().unwrap(), label, counter)
     }
 

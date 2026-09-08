@@ -7,13 +7,14 @@
 use {
     crate::{
         cluster_info_metrics::GossipStats,
-        crds::{Crds, GossipRoute},
+        crds::GossipRoute,
         crds_data::CrdsData,
         crds_gossip_error::CrdsGossipError,
         crds_gossip_pull::{
             CrdsFilter, CrdsGossipPull, CrdsTimeouts, ProcessPullStats, PullRequest,
         },
         crds_gossip_push::CrdsGossipPush,
+        crds_rwlock::CrdsRwLock,
         crds_value::CrdsValue,
         duplicate_shred::{self, DuplicateShredIndex, MAX_DUPLICATE_SHREDS},
         protocol::{Ping, PingCache},
@@ -32,14 +33,14 @@ use {
         cmp,
         collections::{HashMap, HashSet},
         net::SocketAddr,
-        sync::{Mutex, RwLock},
+        sync::Mutex,
         time::{Duration, Instant},
     },
 };
 
 #[derive(Default)]
 pub struct CrdsGossip {
-    pub crds: RwLock<Crds>,
+    pub crds: CrdsRwLock,
     pub push: CrdsGossipPush,
     pub pull: CrdsGossipPull,
 }
@@ -325,7 +326,7 @@ pub(crate) fn get_gossip_nodes<R: Rng>(
     // By default, should only push to or pull from gossip nodes with the same
     // shred-version.
     verify_shred_version: impl Fn(/*shred_version:*/ u16) -> bool,
-    crds: &RwLock<Crds>,
+    crds: &CrdsRwLock,
     gossip_validators: Option<&HashSet<Pubkey>>,
     stakes: &HashMap<Pubkey, u64>,
     socket_addr_space: &SocketAddrSpace,
