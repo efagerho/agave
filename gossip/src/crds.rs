@@ -32,15 +32,16 @@ use {
         contact_info_notifier::{ContactInfoEvent, ContactInfoSender, ContactInfoSnapshot},
         crds_data::CrdsData,
         crds_entry::CrdsEntry,
-        crds_gossip_pull::CrdsTimeouts,
+        crds_gossip_pull::{CrdsFilter, CrdsTimeouts},
         crds_shards::CrdsShards,
         crds_value::{CrdsValue, CrdsValueLabel},
     },
     assert_matches::debug_assert_matches,
     indexmap::{
-        map::{Entry, IndexMap, rayon::ParValues},
+        map::{Entry, IndexMap},
         set::IndexSet,
     },
+    itertools::Either,
     lazy_lru::LruCache,
     rand::{rng, seq::IteratorRandom},
     rayon::{ThreadPool, prelude::*},
@@ -65,6 +66,91 @@ const VOTE_SLOTS_METRICS_CAP: usize = 100;
 // log2(680k) = ~19.375.
 pub(crate) const SIGNATURE_SAMPLE_LEADING_ZEROS: u32 = 19;
 
+/// Recently purged hashes grouped by their leading hash bits.
+///
+/// Each shard retains timestamp order, which is sufficient for expiration,
+/// while allowing pull-request bloom filters to visit only the hash-prefix
+/// shards selected for the current request.
+struct PurgedHashes {
+    shards: Vec<VecDeque<Hash>>,
+    expirations: VecDeque<(u64 /*timestamp*/, u16 /*shard index*/)>,
+    shard_bits: u32,
+}
+
+impl PurgedHashes {
+    fn new(shard_bits: u32) -> Self {
+        assert!(shard_bits <= u16::BITS);
+        Self {
+            shards: vec![VecDeque::new(); 1 << shard_bits],
+            expirations: VecDeque::new(),
+            shard_bits,
+        }
+    }
+
+    fn push_back(&mut self, (hash, timestamp): (Hash, u64)) {
+        let index = self.shard_index(CrdsFilter::hash_as_u64(&hash));
+        self.shards[index].push_back(hash);
+        self.expirations
+            .push_back((timestamp, u16::try_from(index).unwrap()));
+    }
+
+    fn len(&self) -> usize {
+        self.expirations.len()
+    }
+
+    #[cfg(test)]
+    fn is_empty(&self) -> bool {
+        self.expirations.is_empty()
+    }
+
+    #[cfg(test)]
+    fn hashes(&self) -> impl Iterator<Item = Hash> + '_ {
+        self.shards.iter().flat_map(VecDeque::iter).copied()
+    }
+
+    /// Returns hashes whose first `mask_bits` bits match `mask`.
+    fn find(&self, mask: u64, mask_bits: u32) -> impl Iterator<Item = Hash> + '_ {
+        let mask = CrdsFilter::canonical_mask(mask, mask_bits);
+        let count = 1 << self.shard_bits.saturating_sub(mask_bits);
+        let end = self.shard_index(mask) + 1;
+        let hashes = self.shards[end - count..end]
+            .iter()
+            .flat_map(VecDeque::iter)
+            .copied();
+        if mask_bits > self.shard_bits {
+            Either::Left(hashes.filter(move |hash| {
+                CrdsFilter::hash_matches_mask_prefix(mask, mask_bits, CrdsFilter::hash_as_u64(hash))
+            }))
+        } else {
+            Either::Right(hashes)
+        }
+    }
+
+    /// Drops hashes with timestamps less than `timestamp`.
+    fn trim(&mut self, timestamp: u64) {
+        while let Some(&(value_timestamp, shard)) = self.expirations.front() {
+            if value_timestamp >= timestamp {
+                break;
+            }
+            self.expirations.pop_front();
+            let shard = usize::from(shard);
+            let hash = self.shards[shard].pop_front().unwrap();
+            debug_assert_eq!(self.shard_index(CrdsFilter::hash_as_u64(&hash)), shard);
+        }
+    }
+
+    #[inline]
+    fn shard_index(&self, hash: u64) -> usize {
+        hash.checked_shr(64 - self.shard_bits).unwrap_or(0) as usize
+    }
+}
+
+impl Default for PurgedHashes {
+    fn default() -> Self {
+        Self::new(CRDS_SHARDS_BITS)
+    }
+}
+
 pub struct Crds {
     /// Stores the map of labels and values
     table: IndexMap<CrdsValueLabel, VersionedCrdsValue>,
@@ -82,7 +168,7 @@ pub struct Crds {
     // Indices of all entries keyed by insert order.
     entries: BTreeMap<u64 /*insert order*/, usize /*index*/>,
     // Hash of recently purged values.
-    purged: VecDeque<(Hash, u64 /*timestamp*/)>,
+    purged: PurgedHashes,
     stats: Mutex<CrdsStats>,
     // Optional channel that receives a snapshot of every accepted contact
     // info update. When `None` (the default), no work is done on the hot
@@ -183,7 +269,7 @@ impl Default for Crds {
             duplicate_shreds: BTreeMap::default(),
             records: HashMap::default(),
             entries: BTreeMap::default(),
-            purged: VecDeque::default(),
+            purged: PurgedHashes::default(),
             stats: Mutex::<CrdsStats>::default(),
             contact_info_sender: None,
         }
@@ -486,26 +572,13 @@ impl Crds {
         self.table.values()
     }
 
-    pub(crate) fn par_values(&self) -> ParValues<'_, CrdsValueLabel, VersionedCrdsValue> {
-        self.table.par_values()
-    }
-
     pub(crate) fn num_purged(&self) -> usize {
         self.purged.len()
     }
 
-    pub(crate) fn purged(&self) -> impl IndexedParallelIterator<Item = Hash> + '_ {
-        self.purged.par_iter().map(|(hash, _)| *hash)
-    }
-
     /// Drops purged value hashes with timestamp less than the given one.
     pub(crate) fn trim_purged(&mut self, timestamp: u64) {
-        let count = self
-            .purged
-            .iter()
-            .take_while(|(_, ts)| *ts < timestamp)
-            .count();
-        self.purged.drain(..count);
+        self.purged.trim(timestamp);
     }
 
     /// Returns all crds values which the first 'mask_bits'
@@ -524,6 +597,25 @@ impl Crds {
 
     pub(crate) fn filter_bitmask_scan_count(&self, mask: u64, mask_bits: u32) -> usize {
         self.shards.find_count(mask, mask_bits)
+    }
+
+    /// Returns live and recently purged hashes whose first `mask_bits` bits
+    /// match `mask`. Includes deprecated values because pull-request bloom
+    /// filters cover every value in CRDS.
+    pub(crate) fn filter_hashes(
+        &self,
+        mask: u64,
+        mask_bits: u32,
+    ) -> impl Iterator<Item = Hash> + '_ {
+        self.shards
+            .find(mask, mask_bits)
+            .map(move |index| *self.table.index(index).value.hash())
+            .chain(self.purged.find(mask, mask_bits))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn purged_hashes(&self) -> impl Iterator<Item = Hash> + '_ {
+        self.purged.hashes()
     }
 
     /// Update the timestamp's of all the labels that are associated with Pubkey
@@ -779,7 +871,6 @@ impl CrdsDataStats {
             let num_nodes = self.votes.get(&slot).copied().unwrap_or_default();
             self.votes.put(slot, num_nodes + 1);
         }
-
         let GossipRoute::PushMessage(from) = route else {
             return;
         };
@@ -874,6 +965,71 @@ mod tests {
             time::Duration,
         },
     };
+
+    #[test]
+    fn test_purged_hashes() {
+        fn new_hash(value: u64) -> Hash {
+            let mut bytes = [0u8; 32];
+            bytes[..8].copy_from_slice(&value.to_le_bytes());
+            Hash::new_from_array(bytes)
+        }
+
+        let hash_0001 = new_hash(0x1000_0000_0000_0000);
+        let hash_0011 = new_hash(0x3000_0000_0000_0000);
+        let hash_1000 = new_hash(0x8000_0000_0000_0000);
+        let mut purged = PurgedHashes::new(3);
+        purged.push_back((hash_0001, 1));
+        purged.push_back((hash_0011, 2));
+        purged.push_back((hash_1000, 3));
+        purged.push_back((hash_0001, 4));
+        assert_eq!(purged.len(), 4);
+
+        let hashes: Vec<_> = purged.find(0, 2).collect();
+        assert_eq!(hashes.len(), 3);
+        assert_eq!(hashes.iter().filter(|&&hash| hash == hash_0001).count(), 2);
+        assert!(hashes.contains(&hash_0011));
+        assert_eq!(
+            purged.find(0x2000_0000_0000_0000, 3).collect::<Vec<_>>(),
+            vec![hash_0011]
+        );
+        assert_eq!(
+            purged.find(0x1000_0000_0000_0000, 4).collect::<Vec<_>>(),
+            vec![hash_0001, hash_0001]
+        );
+        assert_eq!(purged.find(u64::MAX, 0).count(), 4);
+        assert_eq!(
+            purged.find(0x1000_0000_0000_0000, 64).collect::<Vec<_>>(),
+            vec![hash_0001, hash_0001]
+        );
+        assert!(purged.find(0x1000_0000_0000_0001, 64).next().is_none());
+
+        // With no shard bits, every prefix is matched within the same shard.
+        let mut unsharded = PurgedHashes::new(0);
+        for hash in [hash_0001, hash_0011, hash_1000] {
+            unsharded.push_back((hash, 1));
+        }
+        assert_eq!(unsharded.find(0, 0).count(), 3);
+        assert_eq!(
+            unsharded
+                .find(0x1000_0000_0000_0000, 64)
+                .collect::<Vec<_>>(),
+            vec![hash_0001]
+        );
+
+        purged.trim(3);
+        assert_eq!(purged.len(), 2);
+        let hashes: Vec<_> = purged.hashes().collect();
+        assert!(hashes.contains(&hash_1000));
+        assert!(hashes.contains(&hash_0001));
+        purged.trim(3);
+        assert_eq!(purged.len(), 2);
+        purged.trim(4);
+        assert_eq!(purged.hashes().collect::<Vec<_>>(), vec![hash_0001]);
+        purged.trim(5);
+        purged.trim(u64::MAX);
+        assert!(purged.is_empty());
+        assert!(purged.find(0, 0).next().is_none());
+    }
 
     #[test]
     fn test_insert() {
@@ -1004,7 +1160,7 @@ mod tests {
             crds.insert(val.clone(), 1, GossipRoute::LocalMessage),
             Ok(())
         );
-        assert_eq!(*crds.purged.back().unwrap(), (value_hash, 1));
+        assert!(crds.purged.hashes().any(|hash| hash == value_hash));
         assert_eq!(crds.table[&val.label()].local_timestamp, 1);
     }
     #[test]
@@ -1032,7 +1188,7 @@ mod tests {
             crds.insert(val2.clone(), 1, GossipRoute::LocalMessage),
             Ok(())
         );
-        assert_eq!(*crds.purged.back().unwrap(), (val1_hash, 1));
+        assert!(crds.purged.hashes().any(|hash| hash == val1_hash));
 
         assert_eq!(crds.table[&val2.label()].local_timestamp, 1);
         assert_eq!(crds.table[&val2.label()].ordinal, 1);
@@ -1534,7 +1690,7 @@ mod tests {
         let values: Vec<_> = crds.table.values().cloned().collect();
         crds.drop(16, &HashSet::new(), &stakes, /*now=*/ 0);
         let purged: Vec<_> = {
-            let purged: HashSet<_> = crds.purged.iter().map(|(hash, _)| hash).copied().collect();
+            let purged: HashSet<_> = crds.purged.hashes().collect();
             values
                 .into_iter()
                 .filter(|v| purged.contains(v.value.hash()))

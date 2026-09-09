@@ -59,6 +59,7 @@ pub const CRDS_GOSSIP_PULL_CRDS_TIMEOUT_MS: u64 = 15000;
 pub const CRDS_GOSSIP_PURGE_DURATION: Duration = Duration::from_secs(2 * 24 * 60 * 60);
 // Retention period of hashes of received outdated values.
 const FAILED_INSERTS_RETENTION_MS: u64 = 20_000;
+const PULL_RESPONSE_FILTER_BATCH_SIZE: usize = 32;
 pub const FALSE_RATE: f64 = 0.1f64;
 pub const KEYS: f64 = 8f64;
 
@@ -221,14 +222,35 @@ impl CrdsFilterSet {
         Self { filters, mask_bits }
     }
 
-    fn add(&self, hash_value: Hash) {
+    #[inline]
+    fn hash_index(&self, hash_value: &Hash) -> usize {
         let shift = u64::BITS.checked_sub(self.mask_bits).unwrap();
-        let index = usize::try_from(
-            CrdsFilter::hash_as_u64(&hash_value)
+        usize::try_from(
+            CrdsFilter::hash_as_u64(hash_value)
                 .checked_shr(shift)
                 .unwrap_or_default(),
         )
-        .unwrap();
+        .unwrap()
+    }
+
+    fn active_masks(&self) -> impl Iterator<Item = u64> + '_ {
+        self.filters
+            .iter()
+            .enumerate()
+            .filter_map(|(seed, filter)| {
+                filter
+                    .as_ref()
+                    .map(|_| CrdsFilter::compute_mask(u64::try_from(seed).unwrap(), self.mask_bits))
+            })
+    }
+
+    #[inline]
+    fn contains_hash_prefix(&self, hash_value: &Hash) -> bool {
+        self.filters[self.hash_index(hash_value)].is_some()
+    }
+
+    fn add(&self, hash_value: Hash) {
+        let index = self.hash_index(&hash_value);
         if let Some(filter) = &self.filters[index] {
             filter.add(&hash_value);
         }
@@ -267,6 +289,14 @@ pub struct CrdsGossipPull {
     failed_inserts: RwLock<VecDeque<(Hash, /*timestamp:*/ u64)>>,
     pub crds_timeout: u64,
     pub num_pulls: AtomicUsize,
+}
+
+#[derive(Clone, Copy)]
+enum PullResponseStatus {
+    Active,
+    Expired,
+    Failed,
+    FailedTimeout,
 }
 
 impl Default for CrdsGossipPull {
@@ -380,34 +410,41 @@ impl CrdsGossipPull {
     ) -> (Vec<CrdsValue>, Vec<CrdsValue>, Vec<Hash>) {
         let mut active_values = vec![];
         let mut expired_values = vec![];
-        let crds = crds.read();
-        let upsert = |response: CrdsValue| {
-            let owner = response.label().pubkey();
-            // Check if the crds value is older than the msg_timeout
-            let timeout = timeouts[&owner];
-            // Before discarding this value, check if a ContactInfo for the
-            // owner exists in the table. If it doesn't, that implies that this
-            // value can be discarded
-            if !crds.upserts(&response) {
-                Some(response)
-            } else if now <= response.wallclock().saturating_add(timeout) {
-                active_values.push(response);
-                None
-            } else if crds.get::<&ContactInfo>(owner).is_some() {
-                // Silently insert this old value without bumping record
-                // timestamps
-                expired_values.push(response);
-                None
-            } else {
-                stats.failed_timeout += 1;
-                Some(response)
+        let mut failed_inserts = vec![];
+        let mut pending = responses.into_iter();
+        let mut statuses = Vec::with_capacity(PULL_RESPONSE_FILTER_BATCH_SIZE);
+        while !pending.as_slice().is_empty() {
+            let batch_len = pending.len().min(PULL_RESPONSE_FILTER_BATCH_SIZE);
+            {
+                let crds = crds.read();
+                statuses.extend(pending.as_slice()[..batch_len].iter().map(|response| {
+                    let owner = response.pubkey();
+                    let timeout = timeouts[&owner];
+                    if !crds.upserts(response) {
+                        PullResponseStatus::Failed
+                    } else if now <= response.wallclock().saturating_add(timeout) {
+                        PullResponseStatus::Active
+                    } else if crds.get::<&ContactInfo>(owner).is_some() {
+                        // Silently insert this old value without bumping record
+                        // timestamps.
+                        PullResponseStatus::Expired
+                    } else {
+                        PullResponseStatus::FailedTimeout
+                    }
+                }));
             }
-        };
-        let failed_inserts = responses
-            .into_iter()
-            .filter_map(upsert)
-            .map(|resp| *resp.hash())
-            .collect();
+            for (response, status) in pending.by_ref().take(batch_len).zip(statuses.drain(..)) {
+                match status {
+                    PullResponseStatus::Active => active_values.push(response),
+                    PullResponseStatus::Expired => expired_values.push(response),
+                    PullResponseStatus::Failed => failed_inserts.push(*response.hash()),
+                    PullResponseStatus::FailedTimeout => {
+                        stats.failed_timeout += 1;
+                        failed_inserts.push(*response.hash());
+                    }
+                }
+            }
+        }
         (active_values, expired_values, failed_inserts)
     }
 
@@ -471,27 +508,32 @@ impl CrdsGossipPull {
         bloom_size: usize,
     ) -> Vec<CrdsFilter> {
         const PAR_MIN_LENGTH: usize = 512;
-        // Snapshot hashes so that the locks are not held while building the filters.
-        let hash_values: Vec<_> = {
-            let failed_inserts = self.failed_inserts.read().unwrap();
-            // crds should be locked last after self.failed_inserts.
+        // Counts are used only to size the filters, so they need not be read
+        // atomically with the subsequent snapshots.
+        let num_items = self.failed_inserts.read().unwrap().len();
+        let num_items = {
             let crds = crds.read();
-            thread_pool.install(|| {
-                crds.par_values()
-                    .with_min_len(PAR_MIN_LENGTH)
-                    .map(|v| *v.value.hash())
-                    .chain(crds.purged().with_min_len(PAR_MIN_LENGTH))
-                    .chain(
-                        failed_inserts
-                            .par_iter()
-                            .with_min_len(PAR_MIN_LENGTH)
-                            .map(|(v, _)| *v),
-                    )
-                    .collect()
-            })
+            num_items + crds.len() + crds.num_purged()
         };
-        let num_items = MIN_NUM_BLOOM_ITEMS.max(hash_values.len());
+        let num_items = MIN_NUM_BLOOM_ITEMS.max(num_items);
         let filters = CrdsFilterSet::new(&mut rand::rng(), num_items, bloom_size);
+
+        // Snapshot only prefixes that have active filters, releasing the read
+        // guard between disjoint prefixes. Bloom construction stays unlocked.
+        let mut hash_values = Vec::with_capacity(num_items.div_ceil(SAMPLE_RATE));
+        for mask in filters.active_masks() {
+            let crds = crds.read();
+            hash_values.extend(crds.filter_hashes(mask, filters.mask_bits));
+        }
+        {
+            let failed_inserts = self.failed_inserts.read().unwrap();
+            hash_values.extend(
+                failed_inserts
+                    .iter()
+                    .map(|(hash, _)| *hash)
+                    .filter(|hash| filters.contains_hash_prefix(hash)),
+            );
+        }
         thread_pool.install(|| {
             hash_values
                 .into_par_iter()
@@ -932,7 +974,7 @@ pub(crate) mod tests {
         );
         assert_eq!(filters.len(), MIN_NUM_BLOOM_FILTERS.max(4));
         let crds = crds.read();
-        let purged: Vec<_> = thread_pool.install(|| crds.purged().collect());
+        let purged: Vec<_> = crds.purged_hashes().collect();
         let hash_values: Vec<_> = crds
             .values()
             .map(|v| *v.value.hash())
@@ -1122,6 +1164,54 @@ pub(crate) mod tests {
         .filter(|peer| peer != old)
         .count();
         assert!(count < 75, "count of peer != old: {count}");
+    }
+
+    #[test_case(0)]
+    #[test_case(31)]
+    #[test_case(32)]
+    #[test_case(33)]
+    #[test_case(65)]
+    fn test_filter_pull_responses_across_batches(num_responses: usize) {
+        let node = CrdsGossipPull::default();
+        let node_crds = parking_lot::RwLock::new(Crds::default());
+        let stakes = HashMap::new();
+        let timeouts = CrdsTimeouts::new(Pubkey::new_unique(), 0, Duration::ZERO, &stakes);
+        let now = 2;
+        let active = CrdsValue::new_unsigned(CrdsData::from(ContactInfo::new_localhost(
+            &Pubkey::new_unique(),
+            now,
+        )));
+        let mut contact_info = ContactInfo::new_localhost(&Pubkey::new_unique(), 0);
+        let failed = CrdsValue::new_unsigned(CrdsData::from(contact_info.clone()));
+        node_crds
+            .write()
+            .insert(failed.clone(), now, GossipRoute::LocalMessage)
+            .unwrap();
+        contact_info.set_wallclock(1);
+        let expired = CrdsValue::new_unsigned(CrdsData::from(contact_info));
+        let timed_out = CrdsValue::new_unsigned(CrdsData::from(ContactInfo::new_localhost(
+            &Pubkey::new_unique(),
+            0,
+        )));
+        let responses: Vec<_> = [active, expired, failed, timed_out]
+            .iter()
+            .cycle()
+            .take(num_responses)
+            .cloned()
+            .collect();
+        let expected_active: Vec<_> = responses.iter().step_by(4).cloned().collect();
+        let expected_expired: Vec<_> = responses.iter().skip(1).step_by(4).cloned().collect();
+        let expected_failed: Vec<_> = responses
+            .chunks(4)
+            .flat_map(|chunk| chunk.iter().skip(2).map(|response| *response.hash()))
+            .collect();
+        let mut stats = ProcessPullStats::default();
+        let (active, expired, failed) =
+            node.filter_pull_responses(&node_crds, &timeouts, responses, now, &mut stats);
+        assert_eq!(active, expected_active);
+        assert_eq!(expired, expected_expired);
+        assert_eq!(failed, expected_failed);
+        assert_eq!(stats.failed_timeout, num_responses / 4);
     }
 
     #[test]
