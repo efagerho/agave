@@ -1,7 +1,7 @@
 //! Arguments for controlling the number of threads allocated for various tasks
 
 use {
-    clap::{Arg, ArgMatches, value_t_or_exit},
+    clap::{Arg, ArgMatches, value_t},
     solana_accounts_db::{accounts_db, accounts_index},
     solana_clap_utils::{hidden_unless_forced, input_validators::is_within_range},
     solana_core::banking_stage::BankingStage,
@@ -110,72 +110,27 @@ pub struct NumThreadConfig {
     pub tvu_bls_sigverify_threads: NonZeroUsize,
 }
 
-pub fn parse_num_threads_args(matches: &ArgMatches) -> NumThreadConfig {
-    NumThreadConfig {
-        accounts_db_background_threads: value_t_or_exit!(
-            matches,
-            AccountsDbBackgroundThreadsArg::NAME,
-            NonZeroUsize
-        ),
-        accounts_index_flush_threads: value_t_or_exit!(
-            matches,
-            AccountsIndexFlushThreadsArg::NAME,
-            NonZeroUsize
-        ),
-        block_production_num_workers: value_t_or_exit!(
-            matches,
-            BlockProductionNumWorkersArg::NAME,
-            NonZeroUsize
-        ),
-        ip_echo_server_threads: value_t_or_exit!(
-            matches,
-            IpEchoServerThreadsArg::NAME,
-            NonZeroUsize
-        ),
-        rayon_global_threads: value_t_or_exit!(matches, RayonGlobalThreadsArg::NAME, NonZeroUsize),
-        replay_forks_threads: value_t_or_exit!(matches, ReplayForksThreadsArg::NAME, NonZeroUsize),
-        replay_transactions_threads: value_t_or_exit!(
-            matches,
-            ReplayTransactionsThreadsArg::NAME,
-            NonZeroUsize
-        ),
-        tpu_sigverify_threads: value_t_or_exit!(
-            matches,
-            TpuSigverifyThreadsArg::NAME,
-            NonZeroUsize
-        ),
-        tpu_transaction_forward_receive_threads: value_t_or_exit!(
-            matches,
+pub fn parse_num_threads_args(matches: &ArgMatches) -> Result<NumThreadConfig, clap::Error> {
+    let threads = |name: &str| value_t!(matches, name, NonZeroUsize);
+    Ok(NumThreadConfig {
+        accounts_db_background_threads: threads(AccountsDbBackgroundThreadsArg::NAME)?,
+        accounts_index_flush_threads: threads(AccountsIndexFlushThreadsArg::NAME)?,
+        block_production_num_workers: threads(BlockProductionNumWorkersArg::NAME)?,
+        ip_echo_server_threads: threads(IpEchoServerThreadsArg::NAME)?,
+        rayon_global_threads: threads(RayonGlobalThreadsArg::NAME)?,
+        replay_forks_threads: threads(ReplayForksThreadsArg::NAME)?,
+        replay_transactions_threads: threads(ReplayTransactionsThreadsArg::NAME)?,
+        tpu_sigverify_threads: threads(TpuSigverifyThreadsArg::NAME)?,
+        tpu_transaction_forward_receive_threads: threads(
             TpuTransactionForwardReceiveThreadArgs::NAME,
-            NonZeroUsize
-        ),
-        tpu_transaction_receive_threads: value_t_or_exit!(
-            matches,
-            TpuTransactionReceiveThreads::NAME,
-            NonZeroUsize
-        ),
-        tpu_vote_transaction_receive_threads: value_t_or_exit!(
-            matches,
-            TpuVoteTransactionReceiveThreads::NAME,
-            NonZeroUsize
-        ),
-        tvu_receive_threads: value_t_or_exit!(matches, TvuReceiveThreadsArg::NAME, NonZeroUsize),
-        tvu_retransmit_threads: value_t_or_exit!(
-            matches,
-            TvuRetransmitThreadsArg::NAME,
-            NonZeroUsize
-        ),
-        tvu_sigverify_threads: value_t_or_exit!(
-            matches,
-            TvuShredSigverifyThreadsArg::NAME,
-            NonZeroUsize
-        ),
-        tvu_bls_sigverify_threads: value_t_or_exit!(
-            matches,
-            TvuBlsShredSigverifyThreadsArg::NAME,
-            NonZeroUsize
-        ),
-    }
+        )?,
+        tpu_transaction_receive_threads: threads(TpuTransactionReceiveThreads::NAME)?,
+        tpu_vote_transaction_receive_threads: threads(TpuVoteTransactionReceiveThreads::NAME)?,
+        tvu_receive_threads: threads(TvuReceiveThreadsArg::NAME)?,
+        tvu_retransmit_threads: threads(TvuRetransmitThreadsArg::NAME)?,
+        tvu_sigverify_threads: threads(TvuShredSigverifyThreadsArg::NAME)?,
+        tvu_bls_sigverify_threads: threads(TvuBlsShredSigverifyThreadsArg::NAME)?,
+    })
 }
 
 /// Configuration for CLAP arguments that control the number of threads for various functions

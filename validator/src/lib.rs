@@ -2,14 +2,12 @@
 pub use solana_test_validator as test_validator;
 use {
     console::style,
-    fd_lock::{RwLock, RwLockWriteGuard},
     indicatif::{ProgressDrawTarget, ProgressStyle},
     std::{
         borrow::Cow,
         fmt::Display,
-        fs::{File, OpenOptions},
+        fs::{self, File, OpenOptions},
         path::Path,
-        process::exit,
         time::Duration,
     },
 };
@@ -86,27 +84,27 @@ impl ProgressBar {
     }
 }
 
-pub fn ledger_lockfile(ledger_path: &Path) -> RwLock<File> {
-    let lockfile = ledger_path.join("ledger.lock");
-    fd_lock::RwLock::new(
-        OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(lockfile)
-            .unwrap(),
-    )
-}
-
-pub fn lock_ledger<'lock>(
-    ledger_path: &Path,
-    ledger_lockfile: &'lock mut RwLock<File>,
-) -> RwLockWriteGuard<'lock, File> {
-    ledger_lockfile.try_write().unwrap_or_else(|_| {
-        println!(
-            "Error: Unable to lock {} directory. Check if another validator is running",
+/// Creates the ledger directory if needed and locks it for this process until the returned file
+/// is dropped
+pub fn lock_ledger(ledger_path: &Path) -> Result<File, String> {
+    fs::create_dir_all(ledger_path).map_err(|err| {
+        format!(
+            "unable to create ledger directory {}: {err}",
             ledger_path.display()
-        );
-        exit(1);
-    })
+        )
+    })?;
+    let lock_path = ledger_path.join("ledger.lock");
+    let lock_file = OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&lock_path)
+        .map_err(|err| format!("unable to open {}: {err}", lock_path.display()))?;
+    lock_file.try_lock().map_err(|err| {
+        format!(
+            "unable to lock {}, check if another validator is running: {err}",
+            lock_path.display()
+        )
+    })?;
+    Ok(lock_file)
 }

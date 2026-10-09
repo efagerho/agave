@@ -4,6 +4,7 @@ use {
         commands::{FromClapArgMatches, Result},
     },
     clap::{Arg, ArgMatches, value_t},
+    solana_clock::Slot,
     solana_genesis_utils::MAX_GENESIS_ARCHIVE_UNPACKED_SIZE,
     std::sync::LazyLock,
 };
@@ -21,6 +22,10 @@ impl Default for RpcBootstrapConfig {
             only_known_rpc: false,
             max_genesis_archive_unpacked_size: 10485760,
             incremental_snapshot_fetch: true,
+            do_port_check: true,
+            maximum_local_snapshot_age: 2500,
+            minimal_snapshot_download_speed: 10485760.0,
+            maximum_snapshot_download_abort: 5,
         }
     }
 }
@@ -53,6 +58,18 @@ impl FromClapArgMatches for RpcBootstrapConfig {
             only_known_rpc,
             max_genesis_archive_unpacked_size,
             incremental_snapshot_fetch: !no_incremental_snapshots,
+            do_port_check: !matches.is_present("no_port_check"),
+            maximum_local_snapshot_age: value_t!(matches, "maximum_local_snapshot_age", Slot)?,
+            minimal_snapshot_download_speed: value_t!(
+                matches,
+                "minimal_snapshot_download_speed",
+                f32
+            )?,
+            maximum_snapshot_download_abort: value_t!(
+                matches,
+                "maximum_snapshot_download_abort",
+                u64
+            )?,
         })
     }
 }
@@ -102,158 +119,84 @@ pub(crate) fn args<'a, 'b>() -> Vec<Arg<'a, 'b>> {
 #[cfg(test)]
 mod tests {
     use {
-        super::*,
-        crate::commands::run::args::{
-            RunArgs, tests::verify_args_struct_by_command_run_with_identity_setup,
-        },
+        super::*, crate::commands::run::args::tests::verify_args_struct_by_command_run,
         solana_pubkey::Pubkey,
-        std::{
-            collections::HashSet,
-            net::{IpAddr, Ipv4Addr, SocketAddr},
-        },
     };
 
     #[test]
+    fn verify_args_struct_by_command_run_with_max_genesis_archive_unpacked_size() {
+        verify_args_struct_by_command_run(
+            vec!["--max-genesis-archive-unpacked-size", "1000000000"],
+            RpcBootstrapConfig {
+                max_genesis_archive_unpacked_size: 1000000000,
+                ..RpcBootstrapConfig::default()
+            },
+        );
+    }
+
+    #[test]
     fn verify_args_struct_by_command_run_with_no_genesis_fetch() {
-        // long arg
-        {
-            let default_run_args = RunArgs::default();
-            let expected_args = RunArgs {
-                rpc_bootstrap_config: RpcBootstrapConfig {
-                    no_genesis_fetch: true,
-                    ..RpcBootstrapConfig::default()
-                },
-                ..default_run_args.clone()
-            };
-            verify_args_struct_by_command_run_with_identity_setup(
-                default_run_args.clone(),
-                vec!["--no-genesis-fetch"],
-                expected_args,
-            );
-        }
+        verify_args_struct_by_command_run(
+            vec!["--no-genesis-fetch"],
+            RpcBootstrapConfig {
+                no_genesis_fetch: true,
+                ..RpcBootstrapConfig::default()
+            },
+        );
     }
 
     #[test]
     fn verify_args_struct_by_command_run_with_no_snapshot_fetch() {
-        // long arg
-        {
-            let default_run_args = RunArgs::default();
-            let expected_args = RunArgs {
-                rpc_bootstrap_config: RpcBootstrapConfig {
-                    no_snapshot_fetch: true,
-                    ..RpcBootstrapConfig::default()
-                },
-                ..default_run_args.clone()
-            };
-            verify_args_struct_by_command_run_with_identity_setup(
-                default_run_args.clone(),
-                vec!["--no-snapshot-fetch"],
-                expected_args,
-            );
-        }
+        verify_args_struct_by_command_run(
+            vec!["--no-snapshot-fetch"],
+            RpcBootstrapConfig {
+                no_snapshot_fetch: true,
+                ..RpcBootstrapConfig::default()
+            },
+        );
     }
 
     #[test]
     fn verify_args_struct_by_command_run_with_check_vote_account() {
-        // long arg
-        {
-            let default_run_args = RunArgs::default();
-            let expected_args = RunArgs {
-                entrypoints: vec![SocketAddr::new(
-                    IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)),
-                    8000,
-                )],
-                rpc_bootstrap_config: RpcBootstrapConfig {
-                    check_vote_account: Some("https://api.mainnet-beta.solana.com".to_string()),
-                    ..RpcBootstrapConfig::default()
-                },
-                ..default_run_args.clone()
-            };
-            verify_args_struct_by_command_run_with_identity_setup(
-                default_run_args,
-                vec![
-                    // required by --check-vote-account
-                    "--entrypoint",
-                    "127.0.0.1:8000",
-                    "--check-vote-account",
-                    "https://api.mainnet-beta.solana.com",
-                ],
-                expected_args,
-            );
-        }
+        verify_args_struct_by_command_run(
+            vec![
+                // required by --check-vote-account
+                "--entrypoint",
+                "127.0.0.1:8000",
+                "--check-vote-account",
+                "https://api.mainnet-beta.solana.com",
+            ],
+            RpcBootstrapConfig {
+                check_vote_account: Some("https://api.mainnet-beta.solana.com".to_string()),
+                ..RpcBootstrapConfig::default()
+            },
+        );
     }
 
     #[test]
     fn verify_args_struct_by_command_run_with_only_known_rpc() {
-        // long arg
-        {
-            let default_run_args = RunArgs::default();
-            let known_validators_pubkey = Pubkey::new_unique();
-            let known_validators = Some(HashSet::from([known_validators_pubkey]));
-            let expected_args = RunArgs {
-                known_validators,
-                rpc_bootstrap_config: RpcBootstrapConfig {
+        let known_validator = Pubkey::new_unique().to_string();
+        for flag in ["--only-known-rpc", "--no-untrusted-rpc"] {
+            verify_args_struct_by_command_run(
+                // --known-validator is required by --only-known-rpc
+                vec!["--known-validator", &known_validator, flag],
+                RpcBootstrapConfig {
                     only_known_rpc: true,
                     ..RpcBootstrapConfig::default()
                 },
-                ..default_run_args.clone()
-            };
-            verify_args_struct_by_command_run_with_identity_setup(
-                default_run_args,
-                vec![
-                    // required by --only-known-rpc
-                    "--known-validator",
-                    &known_validators_pubkey.to_string(),
-                    "--only-known-rpc",
-                ],
-                expected_args,
-            );
-        }
-
-        // alias
-        {
-            let default_run_args = RunArgs::default();
-            let known_validators_pubkey = Pubkey::new_unique();
-            let known_validators = Some(HashSet::from([known_validators_pubkey]));
-            let expected_args = RunArgs {
-                known_validators,
-                rpc_bootstrap_config: RpcBootstrapConfig {
-                    only_known_rpc: true,
-                    ..RpcBootstrapConfig::default()
-                },
-                ..default_run_args.clone()
-            };
-            verify_args_struct_by_command_run_with_identity_setup(
-                default_run_args,
-                vec![
-                    // required by --no-untrusted-rpc
-                    "--known-validator",
-                    &known_validators_pubkey.to_string(),
-                    "--no-untrusted-rpc",
-                ],
-                expected_args,
             );
         }
     }
 
     #[test]
     fn verify_args_struct_by_command_run_with_incremental_snapshot_fetch() {
-        // long arg
-        {
-            let default_run_args = RunArgs::default();
-            let expected_args = RunArgs {
-                rpc_bootstrap_config: RpcBootstrapConfig {
-                    incremental_snapshot_fetch: false,
-                    ..RpcBootstrapConfig::default()
-                },
-                ..default_run_args.clone()
-            };
-            verify_args_struct_by_command_run_with_identity_setup(
-                default_run_args,
-                vec!["--no-incremental-snapshots"],
-                expected_args,
-            );
-        }
+        verify_args_struct_by_command_run(
+            vec!["--no-incremental-snapshots"],
+            RpcBootstrapConfig {
+                incremental_snapshot_fetch: false,
+                ..RpcBootstrapConfig::default()
+            },
+        );
     }
 
     #[test]

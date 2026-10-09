@@ -26,7 +26,6 @@ use {
     solana_gossip::cluster_info::DEFAULT_NUM_VOTOR_QUIC_ENDPOINTS,
     solana_hash::Hash,
     solana_net_utils::{MINIMUM_VALIDATOR_PORT_RANGE_WIDTH, VALIDATOR_PORT_RANGE},
-    solana_send_transaction_service::send_transaction_service::{self},
     solana_streamer::quic::{
         DEFAULT_MAX_CONNECTIONS_PER_IPADDR_PER_MINUTE,
         DEFAULT_MAX_QUIC_CONNECTIONS_PER_STAKED_PEER,
@@ -265,7 +264,6 @@ pub struct DefaultArgs {
     pub ledger_path: String,
 
     pub tower_storage: String,
-    pub send_transaction_service_config: send_transaction_service::Config,
 
     pub maximum_local_snapshot_age: String,
     pub maximum_full_snapshot_archives_to_retain: String,
@@ -312,7 +310,6 @@ impl DefaultArgs {
             dynamic_port_range: format!("{}-{}", VALIDATOR_PORT_RANGE.0, VALIDATOR_PORT_RANGE.1),
             maximum_local_snapshot_age: "2500".to_string(),
             tower_storage: "file".to_string(),
-            send_transaction_service_config: send_transaction_service::Config::default(),
             maximum_full_snapshot_archives_to_retain: DEFAULT_MAX_FULL_SNAPSHOT_ARCHIVES_TO_RETAIN
                 .to_string(),
             maximum_incremental_snapshot_archives_to_retain:
@@ -699,23 +696,6 @@ pub fn test_app<'a>(version: &'a str, default_args: &'a DefaultTestArgs) -> App<
                      AdminRPC: Gossip switches to send/receive from the new interface, while \
                      TVU/TPU continue receiving from ALL interfaces but send from the new \
                      interface only.",
-                ),
-        )
-        .arg(
-            Arg::with_name("advertised_ip")
-                .long("advertised-ip")
-                .value_name("HOST")
-                .takes_value(true)
-                .validator(solana_net_utils::is_host)
-                .hidden(hidden_unless_forced())
-                .help(
-                    "Use when running a validator behind a NAT. DNS name or IP address for this \
-                     validator to advertise in gossip. This address will be used as the target \
-                     destination address for peers trying to contact this node. [default: the \
-                     first --bind-address, or ask --entrypoint when --bind-address is not \
-                     provided, or 127.0.0.1 when --entrypoint is not provided]. Note: this \
-                     argument cannot be used in a multihoming context (when multiple \
-                     --bind-address values are provided).",
                 ),
         )
         .arg(

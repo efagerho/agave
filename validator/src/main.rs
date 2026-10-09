@@ -23,70 +23,23 @@ pub fn main() {
     let (subcommand, maybe_subcommand_matches) = matches.subcommand();
 
     #[cfg(target_os = "linux")]
-    let run_config = {
-        use caps::{CapSet, Capability::CAP_DAC_OVERRIDE, CapsHashSet};
-
-        // we don't aim to execve from the validator, so we can clear most of the
-        // capability sets. clear the ambient set explicitly even though it is
-        // implicitly cleared by clearing the inheritable set
-        caps::clear(None, CapSet::Ambient).expect("linux allows ambient capset to be cleared");
-        caps::clear(None, CapSet::Inheritable)
-            .expect("linux allows inheritable capset to be cleared");
-
-        // we'll raise caps when and where we need them
-        let primordial_caps = if subcommand.is_empty() || subcommand == "run" {
-            // the CAP_DAC_OVERRIDE (file permissions bypass) cap isn't typically needed.
-            // however if it is already in our effective set, likely due to the operator
-            // foolishly running the node as root, either via sudo or suid, we need to
-            // retain it to ensure expected filesystem accessibility
-            let retain_if_set = CapsHashSet::from([CAP_DAC_OVERRIDE]);
-            let permitted = caps::read(None, CapSet::Permitted)
-                .expect("linux allows permitted capset to be read");
-            let effective = caps::read(None, CapSet::Effective)
-                .expect("linux allows effective capset to be read");
-            let primordial_caps =
-                CapsHashSet::from_iter(retain_if_set.intersection(&permitted).copied());
-            let primordial_caps =
-                CapsHashSet::from_iter(primordial_caps.intersection(&effective).copied());
-
-            caps::set(None, CapSet::Effective, &primordial_caps)
-                .expect("linux allows effective capset to be set");
-
-            primordial_caps
-        } else {
-            caps::clear(None, CapSet::Effective)
-                .expect("linux allows effective capset to be cleared");
-            // we only need caps to run the actual valididator. clear them here
-            // for all other subcommands
-            caps::clear(None, CapSet::Permitted)
-                .expect("linux allows permitted capset to be cleared");
-
-            CapsHashSet::new()
-        };
-
-        commands::run::Config { primordial_caps }
-    };
-
+    let process_capabilities = commands::run::capabilities::restrict_at_startup(
+        subcommand.is_empty() || subcommand == "run",
+    );
     #[cfg(not(target_os = "linux"))]
-    let run_config = commands::run::Config {};
+    let process_capabilities = commands::run::ProcessCapabilities {};
 
     match (subcommand, maybe_subcommand_matches) {
-        ("init", _) => commands::run::execute(
-            &matches,
-            solana_version,
-            commands::run::execute::Operation::Initialize,
-            run_config,
-        )
-        .inspect_err(|err| error!("Failed to initialize validator: {err}"))
-        .map_err(commands::Error::Dynamic),
-        ("", _) | ("run", _) => commands::run::execute(
-            &matches,
-            solana_version,
-            commands::run::execute::Operation::Run,
-            run_config,
-        )
-        .inspect_err(|err| error!("Failed to start validator: {err}"))
-        .map_err(commands::Error::Dynamic),
+        ("init", _) | ("", _) | ("run", _) => {
+            let (operation, failure) = if subcommand == "init" {
+                (commands::run::Operation::Initialize, "initialize")
+            } else {
+                (commands::run::Operation::Run, "start")
+            };
+            commands::run::execute(&matches, solana_version, operation, process_capabilities)
+                .inspect_err(|err| error!("Failed to {failure} validator: {err}"))
+                .map_err(commands::Error::Dynamic)
+        }
         ("authorized-voter", Some(authorized_voter_subcommand_matches)) => {
             commands::authorized_voter::execute(authorized_voter_subcommand_matches, &ledger_path)
         }

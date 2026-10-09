@@ -64,7 +64,8 @@ mod tests {
     use {
         super::*,
         crate::commands::run::args::{
-            RunArgs, tests::verify_args_struct_by_command_run_with_identity_setup,
+            json_rpc_config::tests::default_json_rpc_config,
+            tests::verify_args_struct_by_command_run,
         },
         solana_rpc::rpc::JsonRpcConfig,
         test_case::test_case,
@@ -77,43 +78,21 @@ mod tests {
         arg_value: &str,
         expected_index: AccountIndex,
     ) {
-        let default_run_args = crate::commands::run::args::RunArgs::default();
-        let expected_args = RunArgs {
-            json_rpc_config: JsonRpcConfig {
+        verify_args_struct_by_command_run(
+            vec!["--account-index", arg_value],
+            JsonRpcConfig {
                 account_indexes: AccountSecondaryIndexes {
                     keys: None,
                     indexes: HashSet::from([expected_index]),
                 },
-                ..default_run_args.json_rpc_config.clone()
+                ..default_json_rpc_config()
             },
-            ..default_run_args.clone()
-        };
-        verify_args_struct_by_command_run_with_identity_setup(
-            default_run_args,
-            vec!["--account-index", arg_value],
-            expected_args,
         );
     }
 
     #[test]
     fn verify_args_struct_by_command_run_with_account_indexes_multiple() {
-        let default_run_args = crate::commands::run::args::RunArgs::default();
-        let expected_args = RunArgs {
-            json_rpc_config: JsonRpcConfig {
-                account_indexes: AccountSecondaryIndexes {
-                    keys: None,
-                    indexes: HashSet::from([
-                        AccountIndex::ProgramId,
-                        AccountIndex::SplTokenMint,
-                        AccountIndex::SplTokenOwner,
-                    ]),
-                },
-                ..default_run_args.json_rpc_config.clone()
-            },
-            ..default_run_args.clone()
-        };
-        verify_args_struct_by_command_run_with_identity_setup(
-            default_run_args,
+        verify_args_struct_by_command_run(
             vec![
                 "--account-index",
                 "program-id",
@@ -122,7 +101,17 @@ mod tests {
                 "--account-index",
                 "spl-token-owner",
             ],
-            expected_args,
+            JsonRpcConfig {
+                account_indexes: AccountSecondaryIndexes {
+                    keys: None,
+                    indexes: HashSet::from([
+                        AccountIndex::ProgramId,
+                        AccountIndex::SplTokenMint,
+                        AccountIndex::SplTokenOwner,
+                    ]),
+                },
+                ..default_json_rpc_config()
+            },
         );
     }
 
@@ -130,10 +119,15 @@ mod tests {
     fn verify_args_struct_by_command_run_with_account_index_include_key() {
         // single key
         {
-            let default_run_args = crate::commands::run::args::RunArgs::default();
             let account_pubkey_1 = Pubkey::new_unique();
-            let expected_args = RunArgs {
-                json_rpc_config: JsonRpcConfig {
+            verify_args_struct_by_command_run(
+                vec![
+                    "--account-index", // required by --account-index-include-key
+                    "program-id",
+                    "--account-index-include-key",
+                    account_pubkey_1.to_string().as_str(),
+                ],
+                JsonRpcConfig {
                     account_indexes: AccountSecondaryIndexes {
                         keys: Some(AccountSecondaryIndexesIncludeExclude {
                             exclude: false,
@@ -141,30 +135,28 @@ mod tests {
                         }),
                         indexes: HashSet::from([AccountIndex::ProgramId]),
                     },
-                    ..default_run_args.json_rpc_config.clone()
+                    ..default_json_rpc_config()
                 },
-                ..default_run_args.clone()
-            };
-            verify_args_struct_by_command_run_with_identity_setup(
-                default_run_args,
-                vec![
-                    "--account-index", // required by --account-index-include-key
-                    "program-id",
-                    "--account-index-include-key",
-                    account_pubkey_1.to_string().as_str(),
-                ],
-                expected_args,
             );
         }
 
         // multiple keys
         {
-            let default_run_args = crate::commands::run::args::RunArgs::default();
             let account_pubkey_1 = Pubkey::new_unique();
             let account_pubkey_2 = Pubkey::new_unique();
             let account_pubkey_3 = Pubkey::new_unique();
-            let expected_args = RunArgs {
-                json_rpc_config: JsonRpcConfig {
+            verify_args_struct_by_command_run(
+                vec![
+                    "--account-index", // required by --account-index-include-key
+                    "program-id",
+                    "--account-index-include-key",
+                    account_pubkey_1.to_string().as_str(),
+                    "--account-index-include-key",
+                    account_pubkey_2.to_string().as_str(),
+                    "--account-index-include-key",
+                    account_pubkey_3.to_string().as_str(),
+                ],
+                JsonRpcConfig {
                     account_indexes: AccountSecondaryIndexes {
                         keys: Some(AccountSecondaryIndexesIncludeExclude {
                             exclude: false,
@@ -176,23 +168,8 @@ mod tests {
                         }),
                         indexes: HashSet::from([AccountIndex::ProgramId]),
                     },
-                    ..default_run_args.json_rpc_config.clone()
+                    ..default_json_rpc_config()
                 },
-                ..default_run_args.clone()
-            };
-            verify_args_struct_by_command_run_with_identity_setup(
-                default_run_args,
-                vec![
-                    "--account-index", // required by --account-index-include-key
-                    "program-id",
-                    "--account-index-include-key",
-                    account_pubkey_1.to_string().as_str(),
-                    "--account-index-include-key",
-                    account_pubkey_2.to_string().as_str(),
-                    "--account-index-include-key",
-                    account_pubkey_3.to_string().as_str(),
-                ],
-                expected_args,
             );
         }
     }
@@ -201,10 +178,15 @@ mod tests {
     fn verify_args_struct_by_command_run_with_account_index_exclude_key() {
         // single key
         {
-            let default_run_args = crate::commands::run::args::RunArgs::default();
             let account_pubkey_1 = Pubkey::new_unique();
-            let expected_args = RunArgs {
-                json_rpc_config: JsonRpcConfig {
+            verify_args_struct_by_command_run(
+                vec![
+                    "--account-index", // required by --account-index-exclude-key
+                    "program-id",
+                    "--account-index-exclude-key",
+                    account_pubkey_1.to_string().as_str(),
+                ],
+                JsonRpcConfig {
                     account_indexes: AccountSecondaryIndexes {
                         keys: Some(AccountSecondaryIndexesIncludeExclude {
                             exclude: true,
@@ -212,30 +194,28 @@ mod tests {
                         }),
                         indexes: HashSet::from([AccountIndex::ProgramId]),
                     },
-                    ..default_run_args.json_rpc_config.clone()
+                    ..default_json_rpc_config()
                 },
-                ..default_run_args.clone()
-            };
-            verify_args_struct_by_command_run_with_identity_setup(
-                default_run_args,
-                vec![
-                    "--account-index", // required by --account-index-exclude-key
-                    "program-id",
-                    "--account-index-exclude-key",
-                    account_pubkey_1.to_string().as_str(),
-                ],
-                expected_args,
             );
         }
 
         // multiple keys
         {
-            let default_run_args = crate::commands::run::args::RunArgs::default();
             let account_pubkey_1 = Pubkey::new_unique();
             let account_pubkey_2 = Pubkey::new_unique();
             let account_pubkey_3 = Pubkey::new_unique();
-            let expected_args = RunArgs {
-                json_rpc_config: JsonRpcConfig {
+            verify_args_struct_by_command_run(
+                vec![
+                    "--account-index", // required by --account-index-exclude-key
+                    "program-id",
+                    "--account-index-exclude-key",
+                    account_pubkey_1.to_string().as_str(),
+                    "--account-index-exclude-key",
+                    account_pubkey_2.to_string().as_str(),
+                    "--account-index-exclude-key",
+                    account_pubkey_3.to_string().as_str(),
+                ],
+                JsonRpcConfig {
                     account_indexes: AccountSecondaryIndexes {
                         keys: Some(AccountSecondaryIndexesIncludeExclude {
                             exclude: true,
@@ -247,23 +227,8 @@ mod tests {
                         }),
                         indexes: HashSet::from([AccountIndex::ProgramId]),
                     },
-                    ..default_run_args.json_rpc_config.clone()
+                    ..default_json_rpc_config()
                 },
-                ..default_run_args.clone()
-            };
-            verify_args_struct_by_command_run_with_identity_setup(
-                default_run_args,
-                vec![
-                    "--account-index", // required by --account-index-exclude-key
-                    "program-id",
-                    "--account-index-exclude-key",
-                    account_pubkey_1.to_string().as_str(),
-                    "--account-index-exclude-key",
-                    account_pubkey_2.to_string().as_str(),
-                    "--account-index-exclude-key",
-                    account_pubkey_3.to_string().as_str(),
-                ],
-                expected_args,
             );
         }
     }

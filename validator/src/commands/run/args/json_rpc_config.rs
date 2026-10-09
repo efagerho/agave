@@ -191,18 +191,11 @@ pub(crate) fn args<'a, 'b>() -> Vec<Arg<'a, 'b>> {
 #[cfg(test)]
 pub(super) mod tests {
     #[cfg(not(target_os = "linux"))]
-    use crate::commands::run::args::tests::verify_args_struct_by_command_run_is_error_with_identity_setup;
+    use crate::commands::run::args::tests::verify_args_struct_by_command_run_is_error;
     use {
         super::*,
-        crate::commands::run::args::{
-            RunArgs, pub_sub_config::DEFAULT_RPC_PUBSUB_NUM_NOTIFICATION_THREADS,
-            tests::verify_args_struct_by_command_run_with_identity_setup,
-        },
-        solana_rpc::rpc_pubsub_service::PubSubConfig,
-        std::{
-            net::{Ipv4Addr, SocketAddr},
-            num::NonZeroUsize,
-        },
+        crate::commands::run::args::tests::verify_args_struct_by_command_run,
+        std::net::{Ipv4Addr, SocketAddr},
     };
 
     pub fn default_json_rpc_config() -> JsonRpcConfig {
@@ -219,260 +212,149 @@ pub(super) mod tests {
 
     #[test]
     fn verify_args_struct_by_command_run_with_enable_rpc_transaction_history() {
-        {
-            let default_run_args = crate::commands::run::args::RunArgs::default();
-            let expected_args = RunArgs {
-                json_rpc_config: JsonRpcConfig {
-                    enable_rpc_transaction_history: true,
-                    ..default_run_args.json_rpc_config.clone()
-                },
-                ..default_run_args.clone()
-            };
-            verify_args_struct_by_command_run_with_identity_setup(
-                default_run_args,
-                vec!["--enable-rpc-transaction-history"],
-                expected_args,
-            );
-        }
+        verify_args_struct_by_command_run(
+            vec!["--enable-rpc-transaction-history"],
+            JsonRpcConfig {
+                enable_rpc_transaction_history: true,
+                ..default_json_rpc_config()
+            },
+        );
     }
 
     #[test]
     fn verify_args_struct_by_command_run_with_enable_extended_tx_metadata_storage() {
-        {
-            let default_run_args = crate::commands::run::args::RunArgs::default();
-            let expected_args = RunArgs {
-                json_rpc_config: JsonRpcConfig {
-                    enable_rpc_transaction_history: true,
-                    enable_extended_tx_metadata_storage: true,
-                    ..default_run_args.json_rpc_config.clone()
-                },
-                ..default_run_args.clone()
-            };
-            verify_args_struct_by_command_run_with_identity_setup(
-                default_run_args,
-                vec![
-                    "--enable-rpc-transaction-history", // required by enable_extended_tx_metadata_storage
-                    "--enable-extended-tx-metadata-storage",
-                ],
-                expected_args,
-            );
-        }
+        verify_args_struct_by_command_run(
+            vec![
+                "--enable-rpc-transaction-history", // required by enable_extended_tx_metadata_storage
+                "--enable-extended-tx-metadata-storage",
+            ],
+            JsonRpcConfig {
+                enable_rpc_transaction_history: true,
+                enable_extended_tx_metadata_storage: true,
+                ..default_json_rpc_config()
+            },
+        );
     }
 
     #[test]
     fn verify_args_struct_by_command_run_with_rpc_faucet_addr() {
-        {
-            let default_run_args = crate::commands::run::args::RunArgs::default();
-            let expected_args = RunArgs {
-                json_rpc_config: JsonRpcConfig {
-                    faucet_addr: Some(SocketAddr::from((Ipv4Addr::LOCALHOST, 8000))),
-                    ..default_run_args.json_rpc_config.clone()
-                },
-                ..default_run_args.clone()
-            };
-            verify_args_struct_by_command_run_with_identity_setup(
-                default_run_args,
-                vec!["--rpc-faucet-address", "127.0.0.1:8000"],
-                expected_args,
-            );
-        }
+        verify_args_struct_by_command_run(
+            vec!["--rpc-faucet-address", "127.0.0.1:8000"],
+            JsonRpcConfig {
+                faucet_addr: Some(SocketAddr::from((Ipv4Addr::LOCALHOST, 8000))),
+                ..default_json_rpc_config()
+            },
+        );
     }
 
     #[test]
     fn verify_args_struct_by_command_run_with_health_check_slot_distance() {
-        {
-            let default_run_args = crate::commands::run::args::RunArgs::default();
-            let expected_args = RunArgs {
-                json_rpc_config: JsonRpcConfig {
-                    health_check_slot_distance: 100,
-                    ..default_run_args.json_rpc_config.clone()
-                },
-                ..default_run_args.clone()
-            };
-            verify_args_struct_by_command_run_with_identity_setup(
-                default_run_args,
-                vec!["--health-check-slot-distance", "100"],
-                expected_args,
-            );
-        }
+        verify_args_struct_by_command_run(
+            vec!["--health-check-slot-distance", "100"],
+            JsonRpcConfig {
+                health_check_slot_distance: 100,
+                ..default_json_rpc_config()
+            },
+        );
     }
 
     #[test]
     fn verify_args_struct_by_command_run_with_skip_preflight_health_check() {
-        {
-            let default_run_args = crate::commands::run::args::RunArgs::default();
-            let expected_args = RunArgs {
-                json_rpc_config: JsonRpcConfig {
-                    skip_preflight_health_check: true,
-                    ..default_run_args.json_rpc_config.clone()
-                },
-                ..default_run_args.clone()
-            };
-            verify_args_struct_by_command_run_with_identity_setup(
-                default_run_args,
-                vec!["--skip-preflight-health-check"],
-                expected_args,
-            );
-        }
+        verify_args_struct_by_command_run(
+            vec!["--skip-preflight-health-check"],
+            JsonRpcConfig {
+                skip_preflight_health_check: true,
+                ..default_json_rpc_config()
+            },
+        );
     }
 
     #[test]
     fn verify_args_struct_by_command_run_with_max_multiple_accounts() {
-        {
-            let default_run_args = crate::commands::run::args::RunArgs::default();
-            let expected_args = RunArgs {
-                json_rpc_config: JsonRpcConfig {
-                    max_multiple_accounts: Some(9999),
-                    ..default_run_args.json_rpc_config.clone()
-                },
-                ..default_run_args.clone()
-            };
-            verify_args_struct_by_command_run_with_identity_setup(
-                default_run_args,
-                vec!["--rpc-max-multiple-accounts", "9999"],
-                expected_args,
-            );
-        }
+        verify_args_struct_by_command_run(
+            vec!["--rpc-max-multiple-accounts", "9999"],
+            JsonRpcConfig {
+                max_multiple_accounts: Some(9999),
+                ..default_json_rpc_config()
+            },
+        );
     }
 
     #[test]
     fn verify_args_struct_by_command_run_with_rpc_threads() {
-        {
-            let default_run_args = crate::commands::run::args::RunArgs::default();
-            let expected_args = RunArgs {
-                json_rpc_config: JsonRpcConfig {
-                    rpc_threads: 10,
-                    ..default_run_args.json_rpc_config.clone()
-                },
-                ..default_run_args.clone()
-            };
-            verify_args_struct_by_command_run_with_identity_setup(
-                default_run_args,
-                vec!["--rpc-threads", "10"],
-                expected_args,
-            );
-        }
+        verify_args_struct_by_command_run(
+            vec!["--rpc-threads", "10"],
+            JsonRpcConfig {
+                rpc_threads: 10,
+                ..default_json_rpc_config()
+            },
+        );
     }
 
     #[test]
     fn verify_args_struct_by_command_run_with_rpc_blocking_threads() {
-        {
-            let default_run_args = crate::commands::run::args::RunArgs::default();
-            let expected_args = RunArgs {
-                json_rpc_config: JsonRpcConfig {
-                    rpc_blocking_threads: 999,
-                    ..default_run_args.json_rpc_config.clone()
-                },
-                ..default_run_args.clone()
-            };
-            verify_args_struct_by_command_run_with_identity_setup(
-                default_run_args,
-                vec!["--rpc-blocking-threads", "999"],
-                expected_args,
-            );
-        }
+        verify_args_struct_by_command_run(
+            vec!["--rpc-blocking-threads", "999"],
+            JsonRpcConfig {
+                rpc_blocking_threads: 999,
+                ..default_json_rpc_config()
+            },
+        );
     }
 
     #[cfg(target_os = "linux")]
     #[test]
     fn verify_args_struct_by_command_run_with_rpc_niceness_adj() {
-        {
-            let default_run_args = crate::commands::run::args::RunArgs::default();
-            let expected_args = RunArgs {
-                json_rpc_config: JsonRpcConfig {
-                    rpc_niceness_adj: 10,
-                    ..default_run_args.json_rpc_config.clone()
-                },
-                ..default_run_args.clone()
-            };
-            verify_args_struct_by_command_run_with_identity_setup(
-                default_run_args,
-                vec!["--rpc-niceness-adjustment", "10"],
-                expected_args,
-            );
-        }
+        verify_args_struct_by_command_run(
+            vec!["--rpc-niceness-adjustment", "10"],
+            JsonRpcConfig {
+                rpc_niceness_adj: 10,
+                ..default_json_rpc_config()
+            },
+        );
     }
 
     #[cfg(not(target_os = "linux"))]
     #[test]
     fn verify_args_struct_by_command_run_with_rpc_niceness_adj() {
-        verify_args_struct_by_command_run_is_error_with_identity_setup(
-            crate::commands::run::args::RunArgs::default(),
-            vec!["--rpc-niceness-adjustment", "10"],
-        );
+        verify_args_struct_by_command_run_is_error(vec!["--rpc-niceness-adjustment", "10"]);
     }
 
     #[test]
     fn verify_args_struct_by_command_run_with_full_api() {
-        {
-            let default_run_args = crate::commands::run::args::RunArgs::default();
-            let expected_args = RunArgs {
-                json_rpc_config: JsonRpcConfig {
-                    full_api: true,
-                    ..default_run_args.json_rpc_config.clone()
-                },
-                pub_sub_config: PubSubConfig {
-                    notification_threads: Some(
-                        NonZeroUsize::new(
-                            DEFAULT_RPC_PUBSUB_NUM_NOTIFICATION_THREADS
-                                .parse::<usize>()
-                                .unwrap(),
-                        )
-                        .unwrap(),
-                    ),
-                    ..default_run_args.pub_sub_config.clone()
-                },
-                ..default_run_args.clone()
-            };
-            verify_args_struct_by_command_run_with_identity_setup(
-                default_run_args,
-                vec!["--full-rpc-api"],
-                expected_args,
-            );
-        }
+        verify_args_struct_by_command_run(
+            vec!["--full-rpc-api"],
+            JsonRpcConfig {
+                full_api: true,
+                ..default_json_rpc_config()
+            },
+        );
     }
 
     #[test]
     fn verify_args_struct_by_command_run_with_rpc_scan_and_fix_roots() {
-        {
-            let default_run_args = crate::commands::run::args::RunArgs::default();
-            let expected_args = RunArgs {
-                json_rpc_config: JsonRpcConfig {
-                    enable_rpc_transaction_history: true,
-                    rpc_scan_and_fix_roots: true,
-                    ..default_run_args.json_rpc_config.clone()
-                },
-                ..default_run_args.clone()
-            };
-            verify_args_struct_by_command_run_with_identity_setup(
-                default_run_args,
-                vec![
-                    "--enable-rpc-transaction-history", // required by --rpc-scan-and-fix-roots
-                    "--rpc-scan-and-fix-roots",
-                ],
-                expected_args,
-            );
-        }
+        verify_args_struct_by_command_run(
+            vec![
+                "--enable-rpc-transaction-history", // required by --rpc-scan-and-fix-roots
+                "--rpc-scan-and-fix-roots",
+            ],
+            JsonRpcConfig {
+                enable_rpc_transaction_history: true,
+                rpc_scan_and_fix_roots: true,
+                ..default_json_rpc_config()
+            },
+        );
     }
 
     #[test]
     fn verify_args_struct_by_command_run_with_rpc_max_request_body_size() {
-        // long arg
-        {
-            let default_run_args = RunArgs::default();
-            let expected_args = RunArgs {
-                json_rpc_config: JsonRpcConfig {
-                    max_request_body_size: Some(999),
-                    ..default_run_args.json_rpc_config.clone()
-                },
-                ..default_run_args.clone()
-            };
-            verify_args_struct_by_command_run_with_identity_setup(
-                default_run_args,
-                vec!["--rpc-max-request-body-size", "999"],
-                expected_args,
-            );
-        }
+        verify_args_struct_by_command_run(
+            vec!["--rpc-max-request-body-size", "999"],
+            JsonRpcConfig {
+                max_request_body_size: Some(999),
+                ..default_json_rpc_config()
+            },
+        );
     }
 
     #[test]

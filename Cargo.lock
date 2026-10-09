@@ -404,7 +404,6 @@ name = "agave-validator"
 version = "4.5.0-alpha.2"
 dependencies = [
  "agave-cpu-utils",
- "agave-feature-set",
  "agave-logger",
  "agave-snapshots",
  "agave-votor",
@@ -419,7 +418,6 @@ dependencies = [
  "clap 2.33.3",
  "console 0.16.6",
  "crossbeam-channel",
- "fd-lock",
  "indicatif",
  "itertools 0.15.0",
  "jsonrpc-core",
@@ -434,12 +432,10 @@ dependencies = [
  "qualifier_attr",
  "rand 0.9.4",
  "rayon",
- "scopeguard",
  "serde",
  "serde_json",
  "serde_yaml",
  "solana-account",
- "solana-account-decoder",
  "solana-accounts-db",
  "solana-clap-utils",
  "solana-cli-config",
@@ -448,7 +444,6 @@ dependencies = [
  "solana-commitment-config",
  "solana-core",
  "solana-download-utils",
- "solana-entry",
  "solana-epoch-schedule",
  "solana-faucet",
  "solana-genesis-utils",
@@ -464,8 +459,6 @@ dependencies = [
  "solana-net-utils",
  "solana-perf",
  "solana-poh",
- "solana-program-option",
- "solana-program-pack",
  "solana-pubkey 4.4.0",
  "solana-rayon-threadlimit",
  "solana-rent",
@@ -2823,17 +2816,6 @@ name = "fastrand"
 version = "2.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e8c02a5121d4ea3eb16a80748c74f5549a5665e4c21333c6098f283870fbdea6"
-
-[[package]]
-name = "fd-lock"
-version = "4.0.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0ce92ff622d6dadf7349484f42c93271a0d49b7cc4d466a936405bacbe10aa78"
-dependencies = [
- "cfg-if 1.0.5",
- "rustix 1.1.4",
- "windows-sys 0.59.0",
-]
 
 [[package]]
 name = "feature-probe"

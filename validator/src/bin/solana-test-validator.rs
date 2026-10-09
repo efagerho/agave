@@ -1,7 +1,7 @@
 use {
     agave_validator::{
-        admin_rpc_service, cli, commands::FromClapArgMatches, dashboard::Dashboard,
-        ledger_lockfile, lock_ledger, println_name_value,
+        admin_rpc_service, cli, commands::FromClapArgMatches, dashboard::Dashboard, lock_ledger,
+        println_name_value,
     },
     agave_votor::vote_history_storage::FileVoteHistoryStorage,
     clap::{crate_name, value_t, value_t_or_exit, values_t_or_exit},
@@ -93,19 +93,10 @@ fn main() {
         indexes,
     };
 
-    if !ledger_path.exists() {
-        fs::create_dir(&ledger_path).unwrap_or_else(|err| {
-            println!(
-                "Error: Unable to create directory {}: {}",
-                ledger_path.display(),
-                err
-            );
-            exit(1);
-        });
-    }
-
-    let mut ledger_lock = ledger_lockfile(&ledger_path);
-    let _ledger_write_guard = lock_ledger(&ledger_path, &mut ledger_lock);
+    let _ledger_lock = lock_ledger(&ledger_path).unwrap_or_else(|err| {
+        println!("Error: {err}");
+        exit(1);
+    });
     if reset_ledger {
         remove_directory_contents(&ledger_path).unwrap_or_else(|err| {
             println!("Error: Unable to remove {}: {}", ledger_path.display(), err);

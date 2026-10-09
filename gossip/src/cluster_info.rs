@@ -2488,6 +2488,7 @@ pub struct Sockets {
     pub rpc_sts_client: UdpSocket, // quic write only
 }
 
+#[derive(Clone)]
 pub struct NodeConfig {
     /// The IP address advertised to the cluster in gossip
     pub advertised_ip: IpAddr,

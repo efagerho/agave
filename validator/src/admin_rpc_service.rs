@@ -1167,7 +1167,7 @@ where
 }
 
 pub fn load_staked_nodes_overrides(
-    path: &String,
+    path: &str,
 ) -> std::result::Result<StakedNodesOverrides, Box<dyn error::Error>> {
     debug!("Loading staked nodes overrides configuration from {path}");
     if Path::new(&path).exists() {

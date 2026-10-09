@@ -1,13 +1,11 @@
 use {
     crate::{
-        bootstrap::RpcBootstrapConfig,
         cli::{DefaultArgs, hash_validator, port_range_validator, port_validator},
         commands::{FromClapArgMatches, Result},
     },
     agave_snapshots::{SUPPORTED_ARCHIVE_COMPRESSION, SnapshotVersion},
     bytesize::ByteSize,
-    clap::{App, Arg, ArgMatches, values_t},
-    solana_accounts_db::utils::create_and_canonicalize_directory,
+    clap::{App, Arg, ArgMatches},
     solana_clap_utils::{
         hidden_unless_forced,
         input_parsers::keypair_of,
@@ -24,14 +22,10 @@ use {
         validator::{BlockProductionMethod, BlockVerificationMethod},
     },
     solana_keypair::Keypair,
-    solana_ledger::{blockstore_options::BlockstoreOptions, use_snapshot_archives_at_startup},
-    solana_net_utils::SocketAddrSpace,
-    solana_pubkey::Pubkey,
-    solana_rpc::{rpc::JsonRpcConfig, rpc_pubsub_service::PubSubConfig},
-    solana_send_transaction_service::send_transaction_service::Config as SendTransactionServiceConfig,
+    solana_ledger::use_snapshot_archives_at_startup,
     solana_signer::Signer,
     solana_unified_scheduler_pool::DefaultSchedulerPool,
-    std::{collections::HashSet, net::SocketAddr, path::PathBuf},
+    std::path::PathBuf,
 };
 
 const EXCLUDE_KEY: &str = "account-index-exclude-key";
@@ -45,20 +39,11 @@ pub mod rpc_bigtable_config;
 pub mod rpc_bootstrap_config;
 pub mod send_transaction_config;
 
-#[derive(Debug, PartialEq)]
+/// The settings needed before logging starts
 pub struct RunArgs {
     pub identity_keypair: Keypair,
     pub ledger_path: PathBuf,
     pub logfile: Option<PathBuf>,
-    pub entrypoints: Vec<SocketAddr>,
-    pub known_validators: Option<HashSet<Pubkey>>,
-    pub socket_addr_space: SocketAddrSpace,
-    pub rpc_bootstrap_config: RpcBootstrapConfig,
-    pub blockstore_options: BlockstoreOptions,
-    pub json_rpc_config: JsonRpcConfig,
-    pub pub_sub_config: PubSubConfig,
-    pub send_transaction_service_config: SendTransactionServiceConfig,
-    pub filter_keys: HashSet<Pubkey>,
 }
 
 impl FromClapArgMatches for RunArgs {
@@ -75,14 +60,8 @@ impl FromClapArgMatches for RunArgs {
                 clap::ErrorKind::ArgumentNotFound,
             ),
         )?);
-        // Canonicalize ledger path to avoid issues with symlink creation
-        let ledger_path =
-            create_and_canonicalize_directory(ledger_path.as_path()).map_err(|err| {
-                crate::commands::Error::Dynamic(Box::<dyn std::error::Error>::from(format!(
-                    "failed to create and canonicalize ledger path '{}': {err}",
-                    ledger_path.display(),
-                )))
-            })?;
+        // The directory is created and canonicalized when the ledger is locked
+        let ledger_path = std::path::absolute(&ledger_path)?;
 
         let logfile = matches
             .value_of("logfile")
@@ -94,51 +73,10 @@ impl FromClapArgMatches for RunArgs {
             Some(PathBuf::from(logfile))
         };
 
-        let mut entrypoints = values_t!(matches, "entrypoint", String).unwrap_or_default();
-        // sort() + dedup() to yield a vector of unique elements
-        entrypoints.sort();
-        entrypoints.dedup();
-        let entrypoints = entrypoints
-            .into_iter()
-            .map(|entrypoint| {
-                solana_net_utils::parse_host_port(&entrypoint).map_err(|err| {
-                    crate::commands::Error::Dynamic(Box::<dyn std::error::Error>::from(format!(
-                        "failed to parse entrypoint address: {err}"
-                    )))
-                })
-            })
-            .collect::<Result<Vec<_>>>()?;
-
-        let known_validators = validators_set(
-            &identity_keypair.pubkey(),
-            matches,
-            "known_validators",
-            "known validator",
-        )?;
-
-        let socket_addr_space = SocketAddrSpace::new(matches.is_present("allow_private_addr"));
-
         Ok(RunArgs {
             identity_keypair,
             ledger_path,
             logfile,
-            entrypoints,
-            known_validators,
-            socket_addr_space,
-            rpc_bootstrap_config: RpcBootstrapConfig::from_clap_arg_match(matches)?,
-            blockstore_options: BlockstoreOptions::from_clap_arg_match(matches)?,
-            json_rpc_config: JsonRpcConfig::from_clap_arg_match(matches)?,
-            pub_sub_config: PubSubConfig::from_clap_arg_match(matches)?,
-            send_transaction_service_config: SendTransactionServiceConfig::from_clap_arg_match(
-                matches,
-            )?,
-            filter_keys: if matches.is_present("filter_keys") {
-                values_t!(matches, "filter_keys", Pubkey)?
-                    .into_iter()
-                    .collect()
-            } else {
-                HashSet::new()
-            },
         })
     }
 }
@@ -312,6 +250,7 @@ pub fn add_args<'a>(app: App<'a, 'a>, default_args: &'a DefaultArgs) -> App<'a, 
             .long("gossip-port")
             .value_name("PORT")
             .takes_value(true)
+            .validator(port_validator)
             .help("Gossip port number for the validator"),
     )
     .arg(
@@ -1309,601 +1248,97 @@ pub fn add_args<'a>(app: App<'a, 'a>, default_args: &'a DefaultArgs) -> App<'a, 
     .args(&blockstore_options::args())
 }
 
-fn validators_set(
-    identity_pubkey: &Pubkey,
-    matches: &ArgMatches<'_>,
-    matches_name: &str,
-    arg_name: &str,
-) -> Result<Option<HashSet<Pubkey>>> {
-    if matches.is_present(matches_name) {
-        let validators_set: Option<HashSet<Pubkey>> = values_t!(matches, matches_name, Pubkey)
-            .ok()
-            .map(|validators| validators.into_iter().collect());
-        if let Some(validators_set) = &validators_set
-            && validators_set.contains(identity_pubkey)
-        {
-            return Err(crate::commands::Error::Dynamic(
-                Box::<dyn std::error::Error>::from(format!(
-                    "the validator's identity pubkey cannot be a {arg_name}: {identity_pubkey}"
-                )),
-            ));
-        }
-        Ok(validators_set)
-    } else {
-        Ok(None)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use {
         super::*,
         crate::cli::thread_args::thread_args,
-        scopeguard::defer,
         std::{
             fs,
-            net::{IpAddr, Ipv4Addr},
             path::{PathBuf, absolute},
         },
     };
 
-    impl Default for RunArgs {
-        fn default() -> Self {
-            let identity_keypair = Keypair::new();
-            let ledger_path = absolute(PathBuf::from("ledger")).unwrap();
-            let logfile =
-                PathBuf::from(format!("agave-validator-{}.log", identity_keypair.pubkey()));
-            let entrypoints = vec![];
-            let known_validators = None;
-
-            let json_rpc_config =
-                crate::commands::run::args::json_rpc_config::tests::default_json_rpc_config();
-
-            RunArgs {
-                identity_keypair,
-                ledger_path,
-                logfile: Some(logfile),
-                entrypoints,
-                known_validators,
-                socket_addr_space: SocketAddrSpace::Global,
-                rpc_bootstrap_config: RpcBootstrapConfig::default(),
-                blockstore_options: BlockstoreOptions::default(),
-                json_rpc_config,
-                pub_sub_config: PubSubConfig {
-                    worker_threads: 4,
-                    notification_threads: None,
-                    queue_capacity_items:
-                        solana_rpc::rpc_pubsub_service::DEFAULT_QUEUE_CAPACITY_ITEMS,
-                    queue_capacity_bytes:
-                        solana_rpc::rpc_pubsub_service::DEFAULT_QUEUE_CAPACITY_BYTES,
-                    ..PubSubConfig::default_for_tests()
-                },
-                send_transaction_service_config: SendTransactionServiceConfig::default(),
-                filter_keys: HashSet::new(),
-            }
-        }
+    fn parse_run_args(identity_flag: &str, args: &[&str]) -> (Keypair, RunArgs) {
+        let keypair = Keypair::new();
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let file = tmp_dir.path().join("id.json");
+        solana_keypair::write_keypair_file(&keypair, &file).unwrap();
+        let default_args = DefaultArgs::default();
+        let matches = add_args(App::new("run_command"), &default_args).get_matches_from(
+            ["run_command", identity_flag, file.to_str().unwrap()]
+                .iter()
+                .chain(args),
+        );
+        (keypair, RunArgs::from_clap_arg_match(&matches).unwrap())
     }
 
-    impl Clone for RunArgs {
-        fn clone(&self) -> Self {
-            RunArgs {
-                identity_keypair: self.identity_keypair.insecure_clone(),
-                logfile: self.logfile.clone(),
-                entrypoints: self.entrypoints.clone(),
-                known_validators: self.known_validators.clone(),
-                socket_addr_space: self.socket_addr_space,
-                ledger_path: self.ledger_path.clone(),
-                rpc_bootstrap_config: self.rpc_bootstrap_config.clone(),
-                blockstore_options: self.blockstore_options.clone(),
-                json_rpc_config: self.json_rpc_config.clone(),
-                pub_sub_config: self.pub_sub_config.clone(),
-                send_transaction_service_config: self.send_transaction_service_config.clone(),
-                filter_keys: self.filter_keys.clone(),
-            }
-        }
-    }
-
-    fn verify_args_struct_by_command(
-        default_args: &DefaultArgs,
-        args: Vec<&str>,
-        expected_args: RunArgs,
-    ) {
-        let app = add_args(App::new("run_command"), default_args)
+    pub fn verify_args_struct_by_command_run<T>(args: Vec<&str>, expected: T)
+    where
+        T: FromClapArgMatches + PartialEq + std::fmt::Debug,
+    {
+        let default_args = DefaultArgs::default();
+        let app = add_args(App::new("run_command"), &default_args)
             .args(&thread_args(&default_args.thread_args));
-
-        crate::commands::tests::verify_args_struct_by_command::<RunArgs>(
+        crate::commands::tests::verify_args_struct_by_command::<T>(
             app,
             [&["run_command"], &args[..]].concat(),
-            expected_args,
+            expected,
+        );
+    }
+
+    pub fn verify_args_struct_by_command_run_is_error(args: Vec<&str>) {
+        let default_args = DefaultArgs::default();
+        let app = add_args(App::new("run_command"), &default_args)
+            .args(&thread_args(&default_args.thread_args));
+        assert!(
+            app.get_matches_from_safe([&["run_command"], &args[..]].concat())
+                .is_err()
         );
     }
 
     #[test]
     fn verify_args_struct_by_command_run_with_identity() {
-        let default_args = DefaultArgs::default();
-        let default_run_args = RunArgs::default();
-
-        // generate a keypair
-        let tmp_dir = tempfile::tempdir().unwrap();
-        let file = tmp_dir.path().join("id.json");
-        let keypair = default_run_args.identity_keypair.insecure_clone();
-        solana_keypair::write_keypair_file(&keypair, &file).unwrap();
-
-        let expected_args = RunArgs {
-            identity_keypair: keypair.insecure_clone(),
-            ..default_run_args
-        };
-
-        // short arg
-        {
-            verify_args_struct_by_command(
-                &default_args,
-                vec!["-i", file.to_str().unwrap()],
-                expected_args.clone(),
-            );
+        for flag in ["-i", "--identity"] {
+            let (keypair, run_args) = parse_run_args(flag, &[]);
+            assert_eq!(run_args.identity_keypair, keypair);
         }
-
-        // long arg
-        {
-            verify_args_struct_by_command(
-                &default_args,
-                vec!["--identity", file.to_str().unwrap()],
-                expected_args.clone(),
-            );
-        }
-    }
-
-    pub fn verify_args_struct_by_command_run_with_identity_setup(
-        default_run_args: RunArgs,
-        args: Vec<&str>,
-        expected_args: RunArgs,
-    ) {
-        let default_args = DefaultArgs::default();
-
-        // generate a keypair
-        let tmp_dir = tempfile::tempdir().unwrap();
-        let file = tmp_dir.path().join("id.json");
-        let keypair = default_run_args.identity_keypair.insecure_clone();
-        solana_keypair::write_keypair_file(&keypair, &file).unwrap();
-
-        let args = [&["--identity", file.to_str().unwrap()], &args[..]].concat();
-        verify_args_struct_by_command(&default_args, args, expected_args);
-    }
-
-    pub fn verify_args_struct_by_command_run_is_error_with_identity_setup(
-        default_run_args: RunArgs,
-        args: Vec<&str>,
-    ) {
-        let default_args = DefaultArgs::default();
-
-        // generate a keypair
-        let tmp_dir = tempfile::tempdir().unwrap();
-        let file = tmp_dir.path().join("id.json");
-        let keypair = default_run_args.identity_keypair.insecure_clone();
-        solana_keypair::write_keypair_file(&keypair, &file).unwrap();
-
-        let app = add_args(App::new("run_command"), &default_args)
-            .args(&thread_args(&default_args.thread_args));
-
-        crate::commands::tests::verify_args_struct_by_command_is_error::<RunArgs>(
-            app,
-            [
-                &["run_command"],
-                &["--identity", file.to_str().unwrap()][..],
-                &args[..],
-            ]
-            .concat(),
-        );
     }
 
     #[test]
     fn verify_args_struct_by_command_run_with_ledger_path() {
-        // nonexistent absolute ledger path
-        {
-            let default_run_args = RunArgs::default();
-            let tmp_dir = fs::canonicalize(tempfile::tempdir().unwrap()).unwrap();
-            let ledger_path = tmp_dir.join("nonexistent_ledger_path");
-            assert!(!fs::exists(&ledger_path).unwrap());
-
-            let expected_args = RunArgs {
-                ledger_path: ledger_path.clone(),
-                ..default_run_args.clone()
-            };
-            verify_args_struct_by_command_run_with_identity_setup(
-                default_run_args,
-                vec!["--ledger", ledger_path.to_str().unwrap()],
-                expected_args,
-            );
-            assert!(fs::exists(&ledger_path).unwrap());
-        }
-
-        // existing absolute ledger path
-        {
-            let default_run_args = RunArgs::default();
-            let tmp_dir = tempfile::tempdir().unwrap();
-            let ledger_path = tmp_dir.path().join("existing_ledger_path");
-            fs::create_dir_all(&ledger_path).unwrap();
-            let ledger_path = fs::canonicalize(ledger_path).unwrap();
-            assert!(fs::exists(ledger_path.as_path()).unwrap());
-
-            let expected_args = RunArgs {
-                ledger_path: ledger_path.clone(),
-                ..default_run_args.clone()
-            };
-            verify_args_struct_by_command_run_with_identity_setup(
-                default_run_args,
-                vec!["--ledger", ledger_path.to_str().unwrap()],
-                expected_args,
-            );
-            assert!(fs::exists(&ledger_path).unwrap());
-        }
-
-        // nonexistent relative ledger path
-        {
-            let default_run_args = RunArgs::default();
-            let ledger_path = PathBuf::from("nonexistent_ledger_path");
-            assert!(!fs::exists(&ledger_path).unwrap());
-            defer! {
-                fs::remove_dir_all(&ledger_path).unwrap()
-            };
-
-            let expected_args = RunArgs {
-                ledger_path: absolute(&ledger_path).unwrap(),
-                ..default_run_args.clone()
-            };
-            verify_args_struct_by_command_run_with_identity_setup(
-                default_run_args,
-                vec!["--ledger", ledger_path.to_str().unwrap()],
-                expected_args,
-            );
-            assert!(fs::exists(&ledger_path).unwrap());
-        }
-
-        // existing relative ledger path
-        {
-            let default_run_args = RunArgs::default();
-            let ledger_path = PathBuf::from("existing_ledger_path");
-            fs::create_dir_all(&ledger_path).unwrap();
-            assert!(fs::exists(&ledger_path).unwrap());
-            defer! {
-                fs::remove_dir_all(&ledger_path).unwrap()
-            };
-
-            let expected_args = RunArgs {
-                ledger_path: absolute(&ledger_path).unwrap(),
-                ..default_run_args.clone()
-            };
-            verify_args_struct_by_command_run_with_identity_setup(
-                default_run_args,
-                vec!["--ledger", ledger_path.to_str().unwrap()],
-                expected_args,
-            );
-            assert!(fs::exists(&ledger_path).unwrap());
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let absolute_path = tmp_dir.path().join("ledger");
+        let relative_path = PathBuf::from("relative_ledger");
+        for (ledger_path, expected) in [
+            (&absolute_path, absolute_path.clone()),
+            (&relative_path, absolute(&relative_path).unwrap()),
+        ] {
+            let (_, run_args) =
+                parse_run_args("--identity", &["--ledger", ledger_path.to_str().unwrap()]);
+            assert_eq!(run_args.ledger_path, expected);
+            assert!(!fs::exists(ledger_path).unwrap());
         }
     }
 
     #[test]
-    fn verify_args_struct_by_command_run_with_filter_keys() {
-        let default_run_args = RunArgs::default();
-        let filter_key = Pubkey::new_unique();
-        let other_filter_key = Pubkey::new_unique();
-
-        let expected_args = RunArgs {
-            filter_keys: HashSet::from([filter_key, other_filter_key]),
-            ..default_run_args.clone()
-        };
-        verify_args_struct_by_command_run_with_identity_setup(
-            default_run_args,
-            vec![
-                "--filter-keys",
-                &filter_key.to_string(),
-                &other_filter_key.to_string(),
-            ],
-            expected_args,
-        );
+    fn verify_args_struct_by_command_run_with_invalid_gossip_port() {
+        verify_args_struct_by_command_run_is_error(vec!["--gossip-port", "80O"]);
     }
 
     #[test]
     fn verify_args_struct_by_command_run_with_invalid_filter_keys() {
-        let default_run_args = RunArgs::default();
-
-        verify_args_struct_by_command_run_is_error_with_identity_setup(
-            default_run_args,
-            vec!["--filter-keys", "not-a-pubkey"],
-        );
+        verify_args_struct_by_command_run_is_error(vec!["--filter-keys", "not-a-pubkey"]);
     }
 
     #[test]
     fn verify_args_struct_by_command_run_with_log() {
-        let default_run_args = RunArgs::default();
-
-        // default
-        {
-            let expected_args = RunArgs {
-                logfile: Some(PathBuf::from(format!(
-                    "agave-validator-{}.log",
-                    default_run_args.identity_keypair.pubkey()
-                ))),
-                ..default_run_args.clone()
-            };
-            verify_args_struct_by_command_run_with_identity_setup(
-                default_run_args.clone(),
-                vec![],
-                expected_args,
-            );
-        }
-
-        // short arg
-        {
-            let expected_args = RunArgs {
-                logfile: None,
-                ..default_run_args.clone()
-            };
-            verify_args_struct_by_command_run_with_identity_setup(
-                default_run_args.clone(),
-                vec!["-o", "-"],
-                expected_args,
-            );
-        }
-
-        // long arg
-        {
-            let expected_args = RunArgs {
-                logfile: Some(PathBuf::from("custom_log.log")),
-                ..default_run_args.clone()
-            };
-            verify_args_struct_by_command_run_with_identity_setup(
-                default_run_args.clone(),
-                vec!["--log", "custom_log.log"],
-                expected_args,
-            );
-        }
-    }
-
-    #[test]
-    fn verify_args_struct_by_command_run_with_entrypoints() {
-        // short arg + single entrypoint
-        {
-            let default_run_args = RunArgs::default();
-            let expected_args = RunArgs {
-                entrypoints: vec![SocketAddr::new(
-                    IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)),
-                    8000,
-                )],
-                ..default_run_args.clone()
-            };
-            verify_args_struct_by_command_run_with_identity_setup(
-                default_run_args.clone(),
-                vec!["-n", "127.0.0.1:8000"],
-                expected_args,
-            );
-        }
-
-        // long arg + single entrypoint
-        {
-            let default_run_args = RunArgs::default();
-            let expected_args = RunArgs {
-                entrypoints: vec![SocketAddr::new(
-                    IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)),
-                    8000,
-                )],
-                ..default_run_args.clone()
-            };
-            verify_args_struct_by_command_run_with_identity_setup(
-                default_run_args.clone(),
-                vec!["--entrypoint", "127.0.0.1:8000"],
-                expected_args,
-            );
-        }
-
-        // long arg + multiple entrypoints
-        {
-            let default_run_args = RunArgs::default();
-            let expected_args = RunArgs {
-                entrypoints: vec![
-                    SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8000),
-                    SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8001),
-                    SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8002),
-                ],
-                ..default_run_args.clone()
-            };
-            verify_args_struct_by_command_run_with_identity_setup(
-                default_run_args.clone(),
-                vec![
-                    "--entrypoint",
-                    "127.0.0.1:8000",
-                    "--entrypoint",
-                    "127.0.0.1:8001",
-                    "--entrypoint",
-                    "127.0.0.1:8002",
-                ],
-                expected_args,
-            );
-        }
-
-        // long arg + duplicate entrypoints
-        {
-            let default_run_args = RunArgs::default();
-            let expected_args = RunArgs {
-                entrypoints: vec![
-                    SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8000),
-                    SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8001),
-                    SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8002),
-                ],
-                ..default_run_args.clone()
-            };
-            verify_args_struct_by_command_run_with_identity_setup(
-                default_run_args.clone(),
-                vec![
-                    "--entrypoint",
-                    "127.0.0.1:8000",
-                    "--entrypoint",
-                    "127.0.0.1:8001",
-                    "--entrypoint",
-                    "127.0.0.1:8002",
-                    "--entrypoint",
-                    "127.0.0.1:8000",
-                ],
-                expected_args,
-            );
-        }
-    }
-
-    #[test]
-    fn verify_args_struct_by_command_run_with_known_validators() {
-        // long arg + single known validator
-        {
-            let default_run_args = RunArgs::default();
-            let known_validators_pubkey = Pubkey::new_unique();
-            let known_validators = Some(HashSet::from([known_validators_pubkey]));
-            let expected_args = RunArgs {
-                known_validators,
-                ..default_run_args.clone()
-            };
-            verify_args_struct_by_command_run_with_identity_setup(
-                default_run_args,
-                vec!["--known-validator", &known_validators_pubkey.to_string()],
-                expected_args,
-            );
-        }
-
-        // alias + single known validator
-        {
-            let default_run_args = RunArgs::default();
-            let known_validators_pubkey = Pubkey::new_unique();
-            let known_validators = Some(HashSet::from([known_validators_pubkey]));
-            let expected_args = RunArgs {
-                known_validators,
-                ..default_run_args.clone()
-            };
-            verify_args_struct_by_command_run_with_identity_setup(
-                default_run_args,
-                vec!["--trusted-validator", &known_validators_pubkey.to_string()],
-                expected_args,
-            );
-        }
-
-        // long arg + multiple known validators
-        {
-            let default_run_args = RunArgs::default();
-            let known_validators_pubkey_1 = Pubkey::new_unique();
-            let known_validators_pubkey_2 = Pubkey::new_unique();
-            let known_validators_pubkey_3 = Pubkey::new_unique();
-            let known_validators = Some(HashSet::from([
-                known_validators_pubkey_1,
-                known_validators_pubkey_2,
-                known_validators_pubkey_3,
-            ]));
-            let expected_args = RunArgs {
-                known_validators,
-                ..default_run_args.clone()
-            };
-            verify_args_struct_by_command_run_with_identity_setup(
-                default_run_args,
-                vec![
-                    "--known-validator",
-                    &known_validators_pubkey_1.to_string(),
-                    "--known-validator",
-                    &known_validators_pubkey_2.to_string(),
-                    "--known-validator",
-                    &known_validators_pubkey_3.to_string(),
-                ],
-                expected_args,
-            );
-        }
-
-        // long arg + duplicate known validators
-        {
-            let default_run_args = RunArgs::default();
-            let known_validators_pubkey_1 = Pubkey::new_unique();
-            let known_validators_pubkey_2 = Pubkey::new_unique();
-            let known_validators = Some(HashSet::from([
-                known_validators_pubkey_1,
-                known_validators_pubkey_2,
-            ]));
-            let expected_args = RunArgs {
-                known_validators,
-                ..default_run_args.clone()
-            };
-            verify_args_struct_by_command_run_with_identity_setup(
-                default_run_args,
-                vec![
-                    "--known-validator",
-                    &known_validators_pubkey_1.to_string(),
-                    "--known-validator",
-                    &known_validators_pubkey_2.to_string(),
-                    "--known-validator",
-                    &known_validators_pubkey_1.to_string(),
-                ],
-                expected_args,
-            );
-        }
-
-        // use identity pubkey as known validator
-        {
-            let default_args = DefaultArgs::default();
-            let default_run_args = RunArgs::default();
-
-            // generate a keypair
-            let tmp_dir = tempfile::tempdir().unwrap();
-            let file = tmp_dir.path().join("id.json");
-            solana_keypair::write_keypair_file(&default_run_args.identity_keypair, &file).unwrap();
-
-            let matches = add_args(App::new("run_command"), &default_args).get_matches_from(vec![
-                "run_command",
-                "--identity",
-                file.to_str().unwrap(),
-                "--known-validator",
-                &default_run_args.identity_keypair.pubkey().to_string(),
-            ]);
-            let result = RunArgs::from_clap_arg_match(&matches);
-            assert!(result.is_err());
-            let error = result.unwrap_err();
-            assert_eq!(
-                error.to_string(),
-                format!(
-                    "the validator's identity pubkey cannot be a known validator: {}",
-                    default_run_args.identity_keypair.pubkey()
-                )
-            );
-        }
-    }
-
-    #[test]
-    fn verify_args_struct_by_command_run_with_max_genesis_archive_unpacked_size() {
-        // long arg
-        {
-            let default_run_args = RunArgs::default();
-            let max_genesis_archive_unpacked_size = 1000000000;
-            let expected_args = RunArgs {
-                rpc_bootstrap_config: RpcBootstrapConfig {
-                    max_genesis_archive_unpacked_size,
-                    ..RpcBootstrapConfig::default()
-                },
-                ..default_run_args.clone()
-            };
-            verify_args_struct_by_command_run_with_identity_setup(
-                default_run_args,
-                vec![
-                    "--max-genesis-archive-unpacked-size",
-                    &max_genesis_archive_unpacked_size.to_string(),
-                ],
-                expected_args,
-            );
-        }
-    }
-
-    #[test]
-    fn verify_args_struct_by_command_run_with_allow_private_addr() {
-        let default_run_args = RunArgs::default();
-        let expected_args = RunArgs {
-            socket_addr_space: SocketAddrSpace::Unspecified,
-            ..default_run_args.clone()
-        };
-        verify_args_struct_by_command_run_with_identity_setup(
-            default_run_args,
-            vec!["--allow-private-addr", "--no-xdp"],
-            expected_args,
-        );
+        let (keypair, run_args) = parse_run_args("--identity", &[]);
+        let default_logfile = format!("agave-validator-{}.log", keypair.pubkey());
+        assert_eq!(run_args.logfile, Some(PathBuf::from(default_logfile)));
+        let (_, run_args) = parse_run_args("--identity", &["-o", "-"]);
+        assert_eq!(run_args.logfile, None);
+        let (_, run_args) = parse_run_args("--identity", &["--log", "custom_log.log"]);
+        assert_eq!(run_args.logfile, Some(PathBuf::from("custom_log.log")));
     }
 }
