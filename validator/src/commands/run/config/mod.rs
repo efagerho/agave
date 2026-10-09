@@ -4,8 +4,8 @@ use {
         admin_rpc_service::load_staked_nodes_overrides, bootstrap::RpcBootstrapConfig,
         cli::thread_args::parse_num_threads_args, commands::FromClapArgMatches,
     },
+    agave_validator_config::EffectiveConfig,
     agave_votor::vote_history_storage::FileVoteHistoryStorage,
-    agave_xdp::transmitter::XdpConfig,
     arc_swap::ArcSwap,
     clap::{ArgMatches, value_t, values_t},
     log::*,
@@ -51,10 +51,9 @@ mod accounts_db;
 mod network;
 mod snapshot;
 mod tpu;
-#[cfg(target_os = "linux")]
 mod xdp;
 
-/// Validator configuration built and validated from the command line
+/// Validator configuration built and validated from the config file and command line
 pub struct RunConfig {
     pub identity_keypair: Arc<Keypair>,
     pub ledger_path: PathBuf,
@@ -68,7 +67,8 @@ pub struct RunConfig {
     pub private_rpc: bool,
     pub restricted_repair_only_mode: bool,
     pub check_os_network_limits: bool,
-    pub xdp: Option<XdpConfig>,
+    /// The config file's validated XDP policy, when XDP is active
+    pub xdp: Option<EffectiveConfig>,
     pub validator: ValidatorConfig,
     pub tpu: ValidatorTpuConfig,
     pub bootstrap: RpcBootstrapConfig,
@@ -79,6 +79,7 @@ impl RunConfig {
     pub fn new(
         matches: &ArgMatches,
         run_args: RunArgs,
+        file: EffectiveConfig,
         log_config: Option<ValidatorLogConfig>,
         operation: &Operation,
     ) -> Result<Self, Box<dyn Error>> {
@@ -116,12 +117,10 @@ impl RunConfig {
         #[cfg(not(target_os = "linux"))]
         let poh_pinned_cpu_core = None;
 
-        #[cfg(target_os = "linux")]
-        let xdp = xdp::new_config(matches, operation, &node.bind_ip_addrs, poh_pinned_cpu_core)?;
-        #[cfg(not(target_os = "linux"))]
-        let xdp = {
-            let _ = operation;
-            None
+        let xdp = match operation {
+            // XDP is not needed for init, which only initializes the ledger and exits
+            Operation::Initialize => None,
+            Operation::Run => xdp::new_config(file, matches, &node.bind_ip_addrs)?,
         };
 
         let authorized_voter_keypairs = Arc::new(RwLock::new(
@@ -400,16 +399,23 @@ mod tests {
         tempfile::TempDir,
     };
 
-    fn new_run_config(args: &[&str]) -> Result<RunConfig, Box<dyn Error>> {
+    fn new_run_config(
+        operation: Operation,
+        file: Option<&str>,
+        args: &[&str],
+    ) -> Result<RunConfig, Box<dyn Error>> {
         let dir = TempDir::new().unwrap();
         let identity = dir.path().join("identity.json");
         write_keypair_file(&Keypair::new(), &identity).unwrap();
         let ledger = dir.path().join("ledger");
+        let config_path = dir.path().join("config.toml");
+        if let Some(file) = file {
+            std::fs::write(&config_path, file).unwrap();
+        }
         let default_args = DefaultArgs::default();
         let matches = app("test", &default_args).get_matches_from(
             [
                 "agave-validator",
-                "--no-xdp",
                 "--identity",
                 identity.to_str().unwrap(),
                 "--ledger",
@@ -418,20 +424,47 @@ mod tests {
             .iter()
             .chain(args),
         );
+        let file = agave_validator_config::load(file.map(|_| config_path.as_path()))?;
         RunConfig::new(
             &matches,
             RunArgs::from_clap_arg_match(&matches)?,
+            file,
             None,
-            &Operation::Run,
+            &operation,
         )
     }
 
     #[test]
     fn test_default_run_config_defers_network_resolution() {
-        let config = new_run_config(&[]).unwrap();
+        let config = new_run_config(Operation::Run, None, &["--no-xdp"]).unwrap();
         assert!(config.node.advertised_ip.is_unspecified());
         assert_eq!(config.validator.expected_shred_version, None);
         assert!(config.xdp.is_none());
+    }
+
+    #[test]
+    fn test_init_parses_config_without_applying_live_policy() {
+        let file = r#"
+schema_version = 1
+
+[interfaces.one]
+device.name = "eth0"
+[interfaces.one.xdp]
+zero_copy = false
+workers.auto.count = 1
+
+[interfaces.two]
+device.name = "eth1"
+[interfaces.two.xdp]
+zero_copy = false
+workers.auto.count = 1
+"#;
+        let config = new_run_config(Operation::Initialize, Some(file), &[]).unwrap();
+        assert!(config.xdp.is_none());
+        let error = new_run_config(Operation::Run, Some(file), &[])
+            .err()
+            .unwrap();
+        assert!(error.to_string().contains("exactly one"), "{error}");
     }
 
     #[test]
@@ -459,17 +492,22 @@ mod tests {
     fn test_validator_keys() {
         let known = Pubkey::new_unique();
         let other = Pubkey::new_unique();
-        let config = new_run_config(&[
-            "--known-validator",
-            &known.to_string(),
-            "--trusted-validator",
-            &other.to_string(),
-            "--known-validator",
-            &known.to_string(),
-            "--filter-keys",
-            &other.to_string(),
-            "--allow-private-addr",
-        ])
+        let config = new_run_config(
+            Operation::Run,
+            None,
+            &[
+                "--no-xdp",
+                "--known-validator",
+                &known.to_string(),
+                "--trusted-validator",
+                &other.to_string(),
+                "--known-validator",
+                &known.to_string(),
+                "--filter-keys",
+                &other.to_string(),
+                "--allow-private-addr",
+            ],
+        )
         .unwrap();
         assert_eq!(
             config.validator.known_validators,
@@ -498,14 +536,19 @@ mod tests {
 
     #[test]
     fn test_multihoming_rejects_public_tvu_address() {
-        let err = new_run_config(&[
-            "--bind-address",
-            "1.1.1.1",
-            "--bind-address",
-            "2.2.2.2",
-            "--public-tvu-address",
-            "1.1.1.1:8000",
-        ])
+        let err = new_run_config(
+            Operation::Run,
+            None,
+            &[
+                "--no-xdp",
+                "--bind-address",
+                "1.1.1.1",
+                "--bind-address",
+                "2.2.2.2",
+                "--public-tvu-address",
+                "1.1.1.1:8000",
+            ],
+        )
         .err()
         .unwrap();
         assert_eq!(

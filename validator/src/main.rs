@@ -30,6 +30,10 @@ pub fn main() {
     let process_capabilities = commands::run::ProcessCapabilities {};
 
     match (subcommand, maybe_subcommand_matches) {
+        ("print-default-config", _) => {
+            print!("{}", agave_validator_config::DEFAULT_CONFIG);
+            Ok(())
+        }
         ("init", _) | ("", _) | ("run", _) => {
             let (operation, failure) = if subcommand == "init" {
                 (commands::run::Operation::Initialize, "initialize")

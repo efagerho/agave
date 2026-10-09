@@ -18,7 +18,7 @@ use {
         error::Error,
         fmt::Display,
         fs::File,
-        path::PathBuf,
+        path::{Path, PathBuf},
         sync::{Arc, RwLock, atomic::AtomicBool},
         time::SystemTime,
     },
@@ -40,8 +40,9 @@ pub fn execute(
     agave_logger::setup_with_default_filter();
 
     // Everything after this step, logging included, is driven by the configuration
-    let mut run_args = step("loading configuration", || {
-        RunArgs::from_clap_arg_match(matches)
+    let (file, mut run_args) = step("loading configuration", || {
+        let file = agave_validator_config::load(matches.value_of("config_file").map(Path::new))?;
+        Ok::<_, Box<dyn Error>>((file, RunArgs::from_clap_arg_match(matches)?))
     })?;
     let _ledger_lock = step("locking ledger", || {
         storage::lock_ledger(&mut run_args.ledger_path)
@@ -59,7 +60,7 @@ pub fn execute(
     solana_core::validator::report_target_features();
 
     let mut run_config = step("validating configuration", || {
-        RunConfig::new(matches, run_args, log_config, &operation)
+        RunConfig::new(matches, run_args, file, log_config, &operation)
     })?;
 
     step("preparing storage", || {
