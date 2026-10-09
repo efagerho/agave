@@ -1410,6 +1410,30 @@ mod tests {
         );
     }
 
+    pub fn verify_args_struct_by_command_run<T>(args: Vec<&str>, expected: T)
+    where
+        T: FromClapArgMatches + PartialEq + std::fmt::Debug,
+    {
+        let default_args = DefaultArgs::default();
+        let app = add_args(App::new("run_command"), &default_args)
+            .args(&thread_args(&default_args.thread_args));
+        crate::commands::tests::verify_args_struct_by_command::<T>(
+            app,
+            [&["run_command"], &args[..]].concat(),
+            expected,
+        );
+    }
+
+    pub fn verify_args_struct_by_command_run_is_error(args: Vec<&str>) {
+        let default_args = DefaultArgs::default();
+        let app = add_args(App::new("run_command"), &default_args)
+            .args(&thread_args(&default_args.thread_args));
+        assert!(
+            app.get_matches_from_safe([&["run_command"], &args[..]].concat())
+                .is_err()
+        );
+    }
+
     #[test]
     fn verify_args_struct_by_command_run_with_identity() {
         let default_args = DefaultArgs::default();
@@ -1445,7 +1469,7 @@ mod tests {
         }
     }
 
-    pub fn verify_args_struct_by_command_run_with_identity_setup(
+    fn verify_args_struct_by_command_run_with_identity_setup(
         default_run_args: RunArgs,
         args: Vec<&str>,
         expected_args: RunArgs,
@@ -1462,7 +1486,7 @@ mod tests {
         verify_args_struct_by_command(&default_args, args, expected_args);
     }
 
-    pub fn verify_args_struct_by_command_run_is_error_with_identity_setup(
+    fn verify_args_struct_by_command_run_is_error_with_identity_setup(
         default_run_args: RunArgs,
         args: Vec<&str>,
     ) {
@@ -1857,30 +1881,6 @@ mod tests {
                     "the validator's identity pubkey cannot be a known validator: {}",
                     default_run_args.identity_keypair.pubkey()
                 )
-            );
-        }
-    }
-
-    #[test]
-    fn verify_args_struct_by_command_run_with_max_genesis_archive_unpacked_size() {
-        // long arg
-        {
-            let default_run_args = RunArgs::default();
-            let max_genesis_archive_unpacked_size = 1000000000;
-            let expected_args = RunArgs {
-                rpc_bootstrap_config: RpcBootstrapConfig {
-                    max_genesis_archive_unpacked_size,
-                    ..RpcBootstrapConfig::default()
-                },
-                ..default_run_args.clone()
-            };
-            verify_args_struct_by_command_run_with_identity_setup(
-                default_run_args,
-                vec![
-                    "--max-genesis-archive-unpacked-size",
-                    &max_genesis_archive_unpacked_size.to_string(),
-                ],
-                expected_args,
             );
         }
     }

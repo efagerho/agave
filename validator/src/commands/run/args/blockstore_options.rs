@@ -200,12 +200,8 @@ impl FromClapArgMatches for BlockstoreCleanupStrategy {
 mod tests {
     use {
         super::*,
-        crate::commands::run::args::{
-            RunArgs,
-            tests::{
-                verify_args_struct_by_command_run_is_error_with_identity_setup,
-                verify_args_struct_by_command_run_with_identity_setup,
-            },
+        crate::commands::run::args::tests::{
+            verify_args_struct_by_command_run, verify_args_struct_by_command_run_is_error,
         },
         std::ops::RangeInclusive,
         test_case::test_case,
@@ -225,28 +221,18 @@ mod tests {
         arg_value: &str,
         expected_mode: BlockstoreRecoveryMode,
     ) {
-        let default_run_args = crate::commands::run::args::RunArgs::default();
-        let expected_args = RunArgs {
-            blockstore_options: BlockstoreOptions {
-                recovery_mode: Some(expected_mode),
-                ..default_run_args.blockstore_options.clone()
-            },
-            ..default_run_args.clone()
-        };
-        verify_args_struct_by_command_run_with_identity_setup(
-            default_run_args,
+        verify_args_struct_by_command_run(
             vec!["--wal-recovery-mode", arg_value],
-            expected_args,
+            BlockstoreOptions {
+                recovery_mode: Some(expected_mode),
+                ..BlockstoreOptions::default()
+            },
         );
     }
 
     #[test]
     fn verify_args_struct_by_command_run_with_wal_recovery_mode_invalid() {
-        let default_run_args = crate::commands::run::args::RunArgs::default();
-        verify_args_struct_by_command_run_is_error_with_identity_setup(
-            default_run_args,
-            vec!["--wal-recovery-mode", "invalid"],
-        );
+        verify_args_struct_by_command_run_is_error(vec!["--wal-recovery-mode", "invalid"]);
     }
 
     #[test_case("none", BlockstoreCompressionType::None)]
@@ -257,91 +243,57 @@ mod tests {
         arg_value: &str,
         expected_compression: BlockstoreCompressionType,
     ) {
-        let default_run_args = crate::commands::run::args::RunArgs::default();
-        let expected_args = RunArgs {
-            blockstore_options: BlockstoreOptions {
+        verify_args_struct_by_command_run(
+            vec!["--rocksdb-ledger-compression", arg_value],
+            BlockstoreOptions {
                 column_options: LedgerColumnOptions {
                     compression_type: expected_compression,
-                    ..default_run_args.blockstore_options.column_options.clone()
+                    ..BlockstoreOptions::default().column_options
                 },
-                ..default_run_args.blockstore_options.clone()
+                ..BlockstoreOptions::default()
             },
-            ..default_run_args.clone()
-        };
-        verify_args_struct_by_command_run_with_identity_setup(
-            default_run_args,
-            vec!["--rocksdb-ledger-compression", arg_value],
-            expected_args,
         );
     }
 
     #[test]
     fn verify_args_struct_by_command_run_with_rocksdb_ledger_compression_invalid() {
-        let default_run_args = crate::commands::run::args::RunArgs::default();
-        verify_args_struct_by_command_run_is_error_with_identity_setup(
-            default_run_args,
-            vec!["--rocksdb-ledger-compression", "invalid"],
-        );
+        verify_args_struct_by_command_run_is_error(vec!["--rocksdb-ledger-compression", "invalid"]);
     }
 
     #[test]
     fn verify_args_struct_by_command_run_with_rocksdb_perf_sample_interval() {
-        let default_run_args = crate::commands::run::args::RunArgs::default();
-        let expected_args = RunArgs {
-            blockstore_options: BlockstoreOptions {
+        verify_args_struct_by_command_run(
+            vec!["--rocksdb-perf-sample-interval", "100"],
+            BlockstoreOptions {
                 column_options: LedgerColumnOptions {
                     rocks_perf_sample_interval: 100,
-                    ..default_run_args.blockstore_options.column_options.clone()
+                    ..BlockstoreOptions::default().column_options
                 },
-                ..default_run_args.blockstore_options.clone()
+                ..BlockstoreOptions::default()
             },
-            ..default_run_args.clone()
-        };
-        verify_args_struct_by_command_run_with_identity_setup(
-            default_run_args,
-            vec!["--rocksdb-perf-sample-interval", "100"],
-            expected_args,
         );
     }
 
     #[test]
     fn verify_args_struct_by_command_run_with_rocksdb_compaction_threads() {
-        // long arg
-        {
-            let default_run_args = crate::commands::run::args::RunArgs::default();
-            let expected_args = RunArgs {
-                blockstore_options: BlockstoreOptions {
-                    num_rocksdb_compaction_threads: NonZeroUsize::new(1).unwrap(),
-                    ..default_run_args.blockstore_options.clone()
-                },
-                ..default_run_args.clone()
-            };
-            verify_args_struct_by_command_run_with_identity_setup(
-                default_run_args,
-                vec!["--rocksdb-compaction-threads", "1"],
-                expected_args,
-            );
-        }
+        verify_args_struct_by_command_run(
+            vec!["--rocksdb-compaction-threads", "1"],
+            BlockstoreOptions {
+                num_rocksdb_compaction_threads: NonZeroUsize::new(1).unwrap(),
+                ..BlockstoreOptions::default()
+            },
+        );
     }
 
     #[test]
     fn verify_args_struct_by_command_run_with_rocksdb_flush_threads() {
-        // long arg
-        {
-            let default_run_args = crate::commands::run::args::RunArgs::default();
-            let expected_args = RunArgs {
-                blockstore_options: BlockstoreOptions {
-                    num_rocksdb_flush_threads: NonZeroUsize::new(1).unwrap(),
-                    ..default_run_args.blockstore_options.clone()
-                },
-                ..default_run_args.clone()
-            };
-            verify_args_struct_by_command_run_with_identity_setup(
-                default_run_args,
-                vec!["--rocksdb-flush-threads", "1"],
-                expected_args,
-            );
-        }
+        verify_args_struct_by_command_run(
+            vec!["--rocksdb-flush-threads", "1"],
+            BlockstoreOptions {
+                num_rocksdb_flush_threads: NonZeroUsize::new(1).unwrap(),
+                ..BlockstoreOptions::default()
+            },
+        );
     }
 
     #[test]

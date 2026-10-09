@@ -193,135 +193,91 @@ pub(crate) fn args<'a, 'b>() -> Vec<Arg<'a, 'b>> {
 mod tests {
     use {
         super::*,
-        crate::commands::run::args::{
-            RunArgs, tests::verify_args_struct_by_command_run_with_identity_setup,
-        },
+        crate::commands::run::args::tests::verify_args_struct_by_command_run,
         std::net::{Ipv4Addr, SocketAddr},
     };
 
     #[test]
     fn verify_args_struct_by_command_run_with_retry_rate_ms() {
-        let default_run_args = RunArgs::default();
-        let expected_args = RunArgs {
-            send_transaction_service_config: SendTransactionServiceConfig {
-                retry_rate_ms: 99999,
-                ..default_run_args.send_transaction_service_config.clone()
-            },
-            ..default_run_args.clone()
-        };
-        verify_args_struct_by_command_run_with_identity_setup(
-            default_run_args,
+        verify_args_struct_by_command_run(
             vec!["--rpc-send-retry-ms", "99999"],
-            expected_args,
+            SendTransactionServiceConfig {
+                retry_rate_ms: 99999,
+                ..SendTransactionServiceConfig::default()
+            },
         );
     }
 
     #[test]
     fn verify_args_struct_by_command_run_with_batch_size() {
         {
-            let default_run_args = RunArgs::default();
-            let expected_args = RunArgs {
-                send_transaction_service_config: SendTransactionServiceConfig {
-                    batch_size: 1,
-                    ..default_run_args.send_transaction_service_config.clone()
-                },
-                ..default_run_args.clone()
-            };
-            verify_args_struct_by_command_run_with_identity_setup(
-                default_run_args,
+            verify_args_struct_by_command_run(
                 vec!["--rpc-send-batch-size", "1"],
-                expected_args,
+                SendTransactionServiceConfig {
+                    batch_size: 1,
+                    ..SendTransactionServiceConfig::default()
+                },
             );
         }
 
         {
-            let default_run_args = RunArgs::default();
-            let expected_args = RunArgs {
-                send_transaction_service_config: SendTransactionServiceConfig {
-                    batch_size: 999,
-                    batch_send_rate_ms: 1000,
-                    ..default_run_args.send_transaction_service_config.clone()
-                },
-                ..default_run_args.clone()
-            };
-            verify_args_struct_by_command_run_with_identity_setup(
-                default_run_args,
+            verify_args_struct_by_command_run(
                 vec![
                     "--rpc-send-batch-size",
                     "999",
                     "--rpc-send-batch-ms",
                     "1000",
                 ],
-                expected_args,
+                SendTransactionServiceConfig {
+                    batch_size: 999,
+                    batch_send_rate_ms: 1000,
+                    ..SendTransactionServiceConfig::default()
+                },
             );
         }
     }
 
     #[test]
     fn verify_args_struct_by_command_run_with_batch_send_rate_ms() {
-        let default_run_args = RunArgs::default();
-        let expected_args = RunArgs {
-            send_transaction_service_config: SendTransactionServiceConfig {
-                batch_send_rate_ms: 1999,
-                ..default_run_args.send_transaction_service_config.clone()
-            },
-            ..default_run_args.clone()
-        };
-        verify_args_struct_by_command_run_with_identity_setup(
-            default_run_args,
+        verify_args_struct_by_command_run(
             vec!["--rpc-send-batch-ms", "1999"],
-            expected_args,
+            SendTransactionServiceConfig {
+                batch_send_rate_ms: 1999,
+                ..SendTransactionServiceConfig::default()
+            },
         );
     }
 
     #[test]
     fn verify_args_struct_by_command_run_with_default_max_retries() {
-        let default_run_args = RunArgs::default();
-        let expected_args = RunArgs {
-            send_transaction_service_config: SendTransactionServiceConfig {
-                default_max_retries: Some(9999),
-                ..default_run_args.send_transaction_service_config.clone()
-            },
-            ..default_run_args.clone()
-        };
-        verify_args_struct_by_command_run_with_identity_setup(
-            default_run_args,
+        verify_args_struct_by_command_run(
             vec!["--rpc-send-default-max-retries", "9999"],
-            expected_args,
+            SendTransactionServiceConfig {
+                default_max_retries: Some(9999),
+                ..SendTransactionServiceConfig::default()
+            },
         );
     }
 
     #[test]
     fn verify_args_struct_by_command_run_with_service_max_retries() {
-        let default_run_args = RunArgs::default();
-        let expected_args = RunArgs {
-            send_transaction_service_config: SendTransactionServiceConfig {
-                service_max_retries: 9999,
-                ..default_run_args.send_transaction_service_config.clone()
-            },
-            ..default_run_args.clone()
-        };
-        verify_args_struct_by_command_run_with_identity_setup(
-            default_run_args,
+        verify_args_struct_by_command_run(
             vec!["--rpc-send-service-max-retries", "9999"],
-            expected_args,
+            SendTransactionServiceConfig {
+                service_max_retries: 9999,
+                ..SendTransactionServiceConfig::default()
+            },
         );
     }
 
     #[test]
     fn verify_args_struct_by_command_run_with_retry_pool_max_size() {
-        let default_run_args = RunArgs::default();
-        let expected_args = RunArgs {
-            send_transaction_service_config: SendTransactionServiceConfig {
-                retry_pool_max_size: 9999,
-                ..default_run_args.send_transaction_service_config.clone()
-            },
-            ..default_run_args.clone()
-        };
-        verify_args_struct_by_command_run_with_identity_setup(
-            default_run_args,
+        verify_args_struct_by_command_run(
             vec!["--rpc-send-transaction-retry-pool-max-size", "9999"],
-            expected_args,
+            SendTransactionServiceConfig {
+                retry_pool_max_size: 9999,
+                ..SendTransactionServiceConfig::default()
+            },
         );
     }
 
@@ -329,39 +285,19 @@ mod tests {
     fn verify_args_struct_by_command_run_with_tpu_peers() {
         // single tpu peer
         {
-            let default_run_args = RunArgs::default();
-            let expected_args = RunArgs {
-                send_transaction_service_config: SendTransactionServiceConfig {
+            verify_args_struct_by_command_run(
+                vec!["--rpc-send-transaction-tpu-peer", "127.0.0.1:8000"],
+                SendTransactionServiceConfig {
                     tpu_peers: Some(vec![SocketAddr::from((Ipv4Addr::LOCALHOST, 8000))]),
                     leader_forward_count: 0, // see SendTransactionServiceConfig::from_clap_arg_match for more details
-                    ..default_run_args.send_transaction_service_config.clone()
+                    ..SendTransactionServiceConfig::default()
                 },
-                ..default_run_args.clone()
-            };
-            verify_args_struct_by_command_run_with_identity_setup(
-                default_run_args,
-                vec!["--rpc-send-transaction-tpu-peer", "127.0.0.1:8000"],
-                expected_args,
             );
         }
 
         // multiple tpu peers
         {
-            let default_run_args = RunArgs::default();
-            let expected_args = RunArgs {
-                send_transaction_service_config: SendTransactionServiceConfig {
-                    tpu_peers: Some(vec![
-                        SocketAddr::from((Ipv4Addr::LOCALHOST, 8000)),
-                        SocketAddr::from((Ipv4Addr::LOCALHOST, 8001)),
-                        SocketAddr::from((Ipv4Addr::LOCALHOST, 8002)),
-                    ]),
-                    leader_forward_count: 0, // see SendTransactionServiceConfig::from_clap_arg_match for more details
-                    ..default_run_args.send_transaction_service_config.clone()
-                },
-                ..default_run_args.clone()
-            };
-            verify_args_struct_by_command_run_with_identity_setup(
-                default_run_args,
+            verify_args_struct_by_command_run(
                 vec![
                     "--rpc-send-transaction-tpu-peer",
                     "127.0.0.1:8000",
@@ -370,7 +306,15 @@ mod tests {
                     "--rpc-send-transaction-tpu-peer",
                     "127.0.0.1:8002",
                 ],
-                expected_args,
+                SendTransactionServiceConfig {
+                    tpu_peers: Some(vec![
+                        SocketAddr::from((Ipv4Addr::LOCALHOST, 8000)),
+                        SocketAddr::from((Ipv4Addr::LOCALHOST, 8001)),
+                        SocketAddr::from((Ipv4Addr::LOCALHOST, 8002)),
+                    ]),
+                    leader_forward_count: 0, // see SendTransactionServiceConfig::from_clap_arg_match for more details
+                    ..SendTransactionServiceConfig::default()
+                },
             );
         }
     }
@@ -379,57 +323,35 @@ mod tests {
     fn verify_args_struct_by_command_run_with_rpc_send_transaction_leader_forward_count() {
         // rpc-send-transaction-leader-forward-count
         {
-            let default_run_args = RunArgs::default();
-            let expected_args = RunArgs {
-                send_transaction_service_config: SendTransactionServiceConfig {
-                    leader_forward_count: 100,
-                    ..default_run_args.send_transaction_service_config.clone()
-                },
-                ..default_run_args.clone()
-            };
-            verify_args_struct_by_command_run_with_identity_setup(
-                default_run_args,
+            verify_args_struct_by_command_run(
                 vec!["--rpc-send-leader-count", "100"],
-                expected_args,
+                SendTransactionServiceConfig {
+                    leader_forward_count: 100,
+                    ..SendTransactionServiceConfig::default()
+                },
             );
         }
 
         // rpc-send-transaction-leader-forward-count + rpc-send-transaction-tpu-peer
         {
-            let default_run_args = RunArgs::default();
-            let expected_args = RunArgs {
-                send_transaction_service_config: SendTransactionServiceConfig {
-                    leader_forward_count: 0,
-                    tpu_peers: Some(vec![SocketAddr::from((Ipv4Addr::LOCALHOST, 8000))]),
-                    ..default_run_args.send_transaction_service_config.clone()
-                },
-                ..default_run_args.clone()
-            };
-            verify_args_struct_by_command_run_with_identity_setup(
-                default_run_args,
+            verify_args_struct_by_command_run(
                 vec![
                     "--rpc-send-transaction-tpu-peer",
                     "127.0.0.1:8000",
                     "--rpc-send-leader-count",
                     "100",
                 ],
-                expected_args,
+                SendTransactionServiceConfig {
+                    leader_forward_count: 0,
+                    tpu_peers: Some(vec![SocketAddr::from((Ipv4Addr::LOCALHOST, 8000))]),
+                    ..SendTransactionServiceConfig::default()
+                },
             );
         }
 
         // rpc-send-transaction-leader-forward-count + rpc-send-transaction-also-leader + rpc-send-transaction-tpu-peer
         {
-            let default_run_args = RunArgs::default();
-            let expected_args = RunArgs {
-                send_transaction_service_config: SendTransactionServiceConfig {
-                    tpu_peers: Some(vec![SocketAddr::from((Ipv4Addr::LOCALHOST, 8000))]),
-                    leader_forward_count: 100,
-                    ..default_run_args.send_transaction_service_config.clone()
-                },
-                ..default_run_args.clone()
-            };
-            verify_args_struct_by_command_run_with_identity_setup(
-                default_run_args,
+            verify_args_struct_by_command_run(
                 vec![
                     "--rpc-send-transaction-tpu-peer",
                     "127.0.0.1:8000",
@@ -437,7 +359,11 @@ mod tests {
                     "--rpc-send-leader-count",
                     "100",
                 ],
-                expected_args,
+                SendTransactionServiceConfig {
+                    tpu_peers: Some(vec![SocketAddr::from((Ipv4Addr::LOCALHOST, 8000))]),
+                    leader_forward_count: 100,
+                    ..SendTransactionServiceConfig::default()
+                },
             );
         }
     }
