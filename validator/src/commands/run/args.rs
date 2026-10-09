@@ -1309,7 +1309,7 @@ pub fn add_args<'a>(app: App<'a, 'a>, default_args: &'a DefaultArgs) -> App<'a, 
     .args(&blockstore_options::args())
 }
 
-fn validators_set(
+pub(super) fn validators_set(
     identity_pubkey: &Pubkey,
     matches: &ArgMatches<'_>,
     matches_name: &str,
