@@ -84,8 +84,8 @@ where
 ///
 /// Wincode's preallocation limit bounds in-memory collection size (`len * size_of::<T>()`),
 /// not serialized bytes, so the default [`PacketConfig`] rejects payloads whose sequences
-/// are small on the wire but large in memory. Output is still bounded to [`PACKET_DATA_SIZE`]
-/// by the destination buffer.
+/// are small on the wire but large in memory. Serialized size is checked against
+/// [`PACKET_DATA_SIZE`] before allocating the destination buffer.
 pub fn bytes_packet_from_data_with_config<T, C>(
     dest: Option<&SocketAddr>,
     data: T,
@@ -95,19 +95,23 @@ where
     C: Config,
     T: SchemaWrite<C, Src = T>,
 {
-    let mut buffer = [0u8; PACKET_DATA_SIZE];
-    let mut wr = Cursor::new(buffer.as_mut_slice());
-    wincode::config::serialize_into(&mut wr, &data, config)?;
-    let size = wr.position() as usize;
+    let size = T::size_of(&data)?;
+    if size > PACKET_DATA_SIZE {
+        return Err(wincode::io::WriteError::WriteSizeLimit(size).into());
+    }
+    let mut buffer = Vec::with_capacity(size);
+    let mut writer = &mut buffer.spare_capacity_mut()[..size];
+    wincode::config::serialize_into(&mut writer, &data, config)?;
+    let size = size.checked_sub(writer.len()).unwrap();
+    // SAFETY: the slice writer initializes every consumed byte. Serialization
+    // succeeded, and only that initialized prefix is exposed as the Vec's length.
+    unsafe { buffer.set_len(size) };
     let mut meta = Meta::default();
     meta.size = size;
     if let Some(dest) = dest {
         meta.set_socket_addr(dest);
     }
-    Ok(BytesPacket::new(
-        Bytes::copy_from_slice(&buffer[..size]),
-        meta,
-    ))
+    Ok(BytesPacket::new(Bytes::from(buffer), meta))
 }
 
 /// Representation of a packet used in TPU.
@@ -388,6 +392,51 @@ mod tests {
         super::*, solana_hash::Hash, solana_keypair::Keypair, solana_signer::Signer,
         solana_system_transaction::transfer,
     };
+
+    #[test]
+    fn test_bytes_packet_from_data() {
+        let dest = "127.0.0.1:8001".parse().unwrap();
+        let data = (42u64, vec![7u8; 128]);
+        for dest in [None, Some(&dest)] {
+            let packet = packet_from_data(dest, &data).unwrap();
+            let bytes_packet = bytes_packet_from_data(dest, &data).unwrap();
+            assert_eq!(bytes_packet.data(..), packet.data(..));
+            assert_eq!(bytes_packet.meta(), packet.meta());
+            assert_eq!(bytes_packet.buffer().len(), bytes_packet.meta().size);
+        }
+    }
+
+    #[test]
+    fn test_bytes_packet_from_data_size_limits() {
+        let data = [7u8; PACKET_DATA_SIZE];
+        let packet = bytes_packet_from_data(None, data).unwrap();
+        assert_eq!(packet.data(..).unwrap(), data);
+        assert_eq!(packet.meta().size, PACKET_DATA_SIZE);
+        assert!(bytes_packet_from_data(None, [7u8; PACKET_DATA_SIZE + 1]).is_err());
+
+        // Raising the preallocation limit must not raise the wire-size limit.
+        let config = Configuration::default().with_preallocation_size_limit::<{ usize::MAX }>();
+        let data = vec![7u8; PACKET_DATA_SIZE];
+        assert!(bytes_packet_from_data_with_config(None, &data, config).is_err());
+        let packet = bytes_packet_from_data(None, ()).unwrap();
+        assert!(packet.data(..).unwrap().is_empty());
+        assert_eq!(packet.meta().size, 0);
+    }
+
+    #[test]
+    fn test_bytes_packet_from_data_custom_config() {
+        // This sequence fits on the wire but exceeds PacketConfig's limit on
+        // in-memory collection size. Gossip uses a larger preallocation limit.
+        let data = vec![Vec::<u8>::new(); 64];
+        assert!(bytes_packet_from_data(None, &data).is_err());
+        let config = Configuration::default()
+            .with_preallocation_size_limit::<{ usize::MAX }>()
+            .with_length_encoding::<wincode::len::FixIntLen<u32>>();
+        let expected = wincode::config::serialize(&data, config).unwrap();
+        let packet = bytes_packet_from_data_with_config(None, &data, config).unwrap();
+        assert_eq!(packet.data(..).unwrap(), expected);
+        assert_eq!(packet.meta().size, expected.len());
+    }
 
     #[test]
     fn test_to_packet_batches() {
