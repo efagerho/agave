@@ -121,8 +121,10 @@ impl CrdsValue {
             return true;
         }
         let pubkey = self.pubkey();
-        let signable_data = self.signable_data();
-        let message = signable_data.borrow();
+        let mut buffer = [MaybeUninit::<u8>::uninit(); PACKET_DATA_SIZE];
+        let Ok(message) = serialize_crds_data(&self.data, &mut buffer) else {
+            return false;
+        };
         let sig_bytes: [u8; 64] = self.signature.into();
         let signature = ed25519_dalek::Signature::from_bytes(&sig_bytes);
         let verified = match cache.verifying_keys.get(&pubkey) {
@@ -263,13 +265,21 @@ fn hash_signed_data(signature: &Signature, serialized_data: &[u8]) -> Hash {
 // PACKET_DATA_SIZE is always enough since the value originated in a packet.
 fn compute_crds_value_hash(signature: &Signature, data: &CrdsData) -> wincode::WriteResult<Hash> {
     let mut buffer = [MaybeUninit::<u8>::uninit(); PACKET_DATA_SIZE];
-    let mut writer: &mut [MaybeUninit<u8>] = &mut buffer;
+    let bytes = serialize_crds_data(data, &mut buffer)?;
+    Ok(hash_signed_data(signature, bytes))
+}
+
+// Serialize packet-sized signing data without allocating or zeroing the buffer.
+fn serialize_crds_data<'a>(
+    data: &CrdsData,
+    buffer: &'a mut [MaybeUninit<u8>; PACKET_DATA_SIZE],
+) -> wincode::WriteResult<&'a [u8]> {
+    let mut writer: &mut [MaybeUninit<u8>] = buffer;
     wincode::serialize_into(&mut writer, data)?;
     let written = PACKET_DATA_SIZE - writer.len();
     // SAFETY: wincode's "Writer for &mut [MaybeUninit<u8>]" initializes every
     // consumed slot before advancing the cursor, so the first "written" bytes are init.
-    let bytes = unsafe { std::slice::from_raw_parts(buffer.as_ptr().cast::<u8>(), written) };
-    Ok(hash_signed_data(signature, bytes))
+    Ok(unsafe { std::slice::from_raw_parts(buffer.as_ptr().cast::<u8>(), written) })
 }
 
 // Manual implementation of SchemaRead for CrdsValue in order to populate
@@ -298,7 +308,7 @@ unsafe impl<'de, C: Config> SchemaRead<'de, C> for CrdsValue {
 mod test {
     use {
         super::*,
-        crate::crds_data::{LowestSlot, Vote},
+        crate::crds_data::{LowestSlot, SnapshotHashes, Vote},
         rand::SeedableRng as _,
         rand_chacha::ChaChaRng,
         solana_keypair::Keypair,
@@ -366,6 +376,47 @@ mod test {
             value.verify_with_cache(&cache),
             "validly signed value must verify on a cache hit"
         );
+    }
+
+    #[test]
+    fn test_verify_with_cache_variable_size_data() {
+        let keypair = Keypair::new();
+        let cache = SigVerifyCache::new();
+        // Exercise both cold and cached verifying keys, including a value that
+        // nearly fills a packet, with signatures made by the allocating path.
+        for num_hashes in [0, 1, 16, 26] {
+            let data = CrdsData::SnapshotHashes(SnapshotHashes {
+                from: keypair.pubkey(),
+                full: (0, Hash::default()),
+                incremental: vec![(1, Hash::default()); num_hashes],
+                wallclock: 0,
+            });
+            let value = CrdsValue::new(data, &keypair);
+            let bytes = wincode::serialize(&value).unwrap();
+            assert!(bytes.len() <= PACKET_DATA_SIZE);
+            let value: CrdsValue = wincode::deserialize(&bytes).unwrap();
+            assert!(value.verify());
+            assert!(!cache.verified_values.contains(value.hash()));
+            assert!(value.verify_with_cache(&cache));
+            assert!(cache.verified_values.contains(value.hash()));
+        }
+    }
+
+    #[test]
+    fn test_verify_with_cache_oversized_data() {
+        let keypair = Keypair::new();
+        let data = CrdsData::SnapshotHashes(SnapshotHashes {
+            from: keypair.pubkey(),
+            full: (0, Hash::default()),
+            incremental: vec![(1, Hash::default()); 29],
+            wallclock: 0,
+        });
+        let value = CrdsValue::new(data, &keypair);
+        assert!(value.signable_data().len() > PACKET_DATA_SIZE);
+        let cache = SigVerifyCache::new();
+        assert!(!value.verify_with_cache(&cache));
+        assert!(cache.verifying_keys.get(&value.pubkey()).is_none());
+        assert!(!cache.verified_values.contains(value.hash()));
     }
 
     #[test]
