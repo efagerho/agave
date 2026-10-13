@@ -1071,14 +1071,12 @@ impl ClusterInfo {
 
     /// Returns epoch-slots inserted since the given cursor.
     pub fn get_epoch_slots(&self, cursor: &mut Cursor) -> Vec<EpochSlots> {
-        let gossip_crds = self.gossip.crds.read();
-        gossip_crds
-            .get_epoch_slots(cursor)
-            .map(|entry| match entry.value.data() {
+        Crds::collect_epoch_slots(&self.gossip.crds, cursor, |entry| {
+            match entry.value.data() {
                 CrdsData::EpochSlots(_, slots) => slots.clone(),
                 _ => panic!("this should not happen!"),
-            })
-            .collect()
+            }
+        })
     }
 
     /// Returns duplicate-shreds inserted since the given cursor.

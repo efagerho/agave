@@ -487,17 +487,54 @@ impl Crds {
         })
     }
 
-    /// Returns epoch-slots inserted since the given cursor.
+    /// Returns epoch-slots inserted since the given cursor and before `end`.
     /// Updates the cursor as the values are consumed.
-    pub(crate) fn get_epoch_slots<'a>(
+    fn get_epoch_slots<'a>(
         &'a self,
         cursor: &'a mut Cursor,
+        end: u64,
     ) -> impl Iterator<Item = &'a VersionedCrdsValue> {
-        let range = (Bound::Included(cursor.ordinal()), Bound::Unbounded);
-        self.epoch_slots.range(range).map(move |(ordinal, index)| {
-            cursor.consume(*ordinal);
-            self.table.index(*index)
-        })
+        let start = cursor.ordinal();
+        self.epoch_slots
+            .range(start..end.max(start))
+            .map(move |(ordinal, index)| {
+                cursor.consume(*ordinal);
+                self.table.index(*index)
+            })
+    }
+
+    /// Returns the values f returns for epoch-slots inserted since the given
+    /// cursor, taking the read lock once per chunk. Values inserted or updated
+    /// after the walk starts are left for the next call. Updates the cursor as
+    /// the values are consumed.
+    pub(crate) fn collect_epoch_slots<T>(
+        crds: &RwLock<Self>,
+        cursor: &mut Cursor,
+        mut f: impl FnMut(&VersionedCrdsValue) -> T,
+    ) -> Vec<T> {
+        let end = crds.read().cursor.ordinal();
+        let mut out = Vec::new();
+        loop {
+            if !Self::read_epoch_slots_chunk(crds, cursor, end, LOCK_CHUNK_SIZE, &mut out, &mut f) {
+                return out;
+            }
+        }
+    }
+
+    /// Reads up to `size` epoch-slots inserted since the cursor and before
+    /// `end`. Returns false once there are none left to read.
+    fn read_epoch_slots_chunk<T>(
+        crds: &RwLock<Self>,
+        cursor: &mut Cursor,
+        end: u64,
+        size: usize,
+        values: &mut Vec<T>,
+        f: impl FnMut(&VersionedCrdsValue) -> T,
+    ) -> bool {
+        values.reserve(size);
+        let num_values = values.len();
+        values.extend(crds.read().get_epoch_slots(cursor, end).take(size).map(f));
+        values.len() - num_values == size
     }
 
     /// Returns duplicate-shreds inserted since the given cursor.
@@ -1365,7 +1402,10 @@ mod tests {
             .filter(|v| matches!(v.value.data(), CrdsData::EpochSlots(_, _)))
             .count();
         let mut cursor = Cursor(since);
-        assert_eq!(num_epoch_slots, crds.get_epoch_slots(&mut cursor).count());
+        assert_eq!(
+            num_epoch_slots,
+            crds.get_epoch_slots(&mut cursor, crds.cursor.0).count()
+        );
         assert_eq!(
             cursor.0,
             crds.epoch_slots
@@ -1375,7 +1415,7 @@ mod tests {
                 .unwrap_or_default()
                 .max(since)
         );
-        for value in crds.get_epoch_slots(&mut Cursor(since)) {
+        for value in crds.get_epoch_slots(&mut Cursor(since), crds.cursor.0) {
             assert!(value.ordinal >= since);
             assert_matches!(value.value.data(), CrdsData::EpochSlots(_, _));
         }
@@ -1444,12 +1484,13 @@ mod tests {
         assert_eq!(num_votes, crds.get_votes(&mut Cursor::default()).count());
         assert_eq!(
             num_epoch_slots,
-            crds.get_epoch_slots(&mut Cursor::default()).count()
+            crds.get_epoch_slots(&mut Cursor::default(), crds.cursor.0)
+                .count()
         );
         for vote in crds.get_votes(&mut Cursor::default()) {
             assert_matches!(vote.value.data(), CrdsData::Vote(_, _));
         }
-        for epoch_slots in crds.get_epoch_slots(&mut Cursor::default()) {
+        for epoch_slots in crds.get_epoch_slots(&mut Cursor::default(), crds.cursor.0) {
             assert_matches!(epoch_slots.value.data(), CrdsData::EpochSlots(_, _));
         }
         (num_nodes, num_votes, num_epoch_slots)
@@ -1663,6 +1704,105 @@ mod tests {
                 .iter()
                 .any(|(_, node)| node.pubkey() == &target_pubkey),
             "a rejected reread must replace the older accepted candidate"
+        );
+    }
+
+    #[test]
+    fn test_collect_epoch_slots() {
+        const CHUNK_SIZE: usize = 16;
+        // Walks the epoch-slots from the cursor, calling f after each chunk.
+        fn walk(
+            crds: &RwLock<Crds>,
+            cursor: &mut Cursor,
+            mut f: impl FnMut(&mut Crds),
+        ) -> Vec<(u64, CrdsValueLabel)> {
+            let end = crds.read().cursor.0;
+            let mut reads = Vec::new();
+            while Crds::read_epoch_slots_chunk(crds, cursor, end, CHUNK_SIZE, &mut reads, |value| {
+                (value.ordinal, value.value.label())
+            }) {
+                f(&mut crds.write());
+            }
+            reads
+        }
+        let mut rng = rng();
+        let now = 12345;
+        let pubkeys: Vec<_> = repeat_with(Pubkey::new_unique).take(512).collect();
+        let mut num_deferred = 0;
+        for _ in 0..4 {
+            let mut crds = Crds::default();
+            for _ in 0..4096 {
+                insert_random_crds_value(&mut rng, &mut crds, &pubkeys);
+            }
+            let ordinals: Vec<u64> = crds.epoch_slots.keys().copied().collect();
+            assert!(
+                ordinals.len() > 2 * LOCK_CHUNK_SIZE,
+                "num epoch slots: {}",
+                ordinals.len()
+            );
+            let initial: HashSet<CrdsValueLabel> = crds
+                .epoch_slots
+                .values()
+                .map(|&index| crds.table[index].value.label())
+                .collect();
+            let crds = RwLock::new(crds);
+            let collect_since =
+                |since| Crds::collect_epoch_slots(&crds, &mut Cursor(since), |v| v.ordinal);
+            assert_eq!(collect_since(0), ordinals);
+            let since = ordinals[ordinals.len() / 2];
+            assert_eq!(collect_since(since), ordinals[ordinals.len() / 2..]);
+
+            let end = crds.read().cursor.0;
+            let mut cursor = Cursor::default();
+            let reads = walk(&crds, &mut cursor, |crds| {
+                for _ in 0..rng.random_range(1..4) {
+                    let k = rng.random_range(0..crds.epoch_slots.len());
+                    let index = *crds.epoch_slots.values().nth(k).unwrap();
+                    let CrdsData::EpochSlots(ix, slots) = crds.table[index].value.data() else {
+                        unreachable!()
+                    };
+                    let (ix, mut slots) = (*ix, slots.clone());
+                    slots.wallclock += 1;
+                    let value = CrdsValue::new_unsigned(CrdsData::EpochSlots(ix, slots));
+                    crds.insert(value, now, GossipRoute::LocalMessage).unwrap();
+                }
+                for _ in 0..rng.random_range(0..3) {
+                    let k = rng.random_range(0..crds.epoch_slots.len());
+                    let index = *crds.epoch_slots.values().nth(k).unwrap();
+                    let label = crds.table[index].value.label();
+                    crds.remove(&label, now);
+                }
+                for _ in 0..rng.random_range(0..8) {
+                    insert_random_crds_value(&mut rng, crds, &pubkeys);
+                }
+            });
+            assert!(
+                reads.iter().map(|(_, label)| label).all_unique(),
+                "walk must not read a value twice"
+            );
+            assert!(reads.iter().all(|&(ordinal, _)| ordinal < end));
+            let next_reads = walk(&crds, &mut cursor, |_| ());
+            assert!(
+                next_reads.iter().all(|&(ordinal, _)| ordinal >= end),
+                "walk must read every value inserted before it started"
+            );
+            let read_labels: HashSet<_> = reads.iter().map(|(_, label)| label).collect();
+            num_deferred += next_reads
+                .iter()
+                .filter(|(_, label)| initial.contains(label) && !read_labels.contains(label))
+                .count();
+            let reads: HashSet<_> = reads.into_iter().chain(next_reads).collect();
+            let crds = crds.read();
+            for (&ordinal, &index) in &crds.epoch_slots {
+                let label = crds.table[index].value.label();
+                assert!(reads.contains(&(ordinal, label)), "skipped value");
+            }
+            check_crds_value_indices(&mut rng, &crds);
+        }
+        // Values updated before the walk reached them are read by the next walk.
+        assert!(
+            num_deferred > 0,
+            "no update deferred a value to the next walk"
         );
     }
 
