@@ -25,6 +25,7 @@ use {
         crds_value::CrdsValue,
         protocol::{Ping, PingCache},
     },
+    arrayvec::ArrayVec,
     itertools::Itertools,
     parking_lot::RwLock,
     rand::{
@@ -587,7 +588,6 @@ impl CrdsGossipPull {
             now.saturating_sub(msg_timeout)..now.saturating_add(msg_timeout);
         let mut dropped_requests = 0usize;
         let mut total_skipped = 0usize;
-        let crds = crds.read();
         let apply_filter = |request: &PullRequest| {
             if output_size_limit == 0 {
                 return Vec::default();
@@ -598,29 +598,63 @@ impl CrdsGossipPull {
                 dropped_requests += 1;
                 return Vec::default();
             }
-            let scan_len = crds.filter_bitmask_scan_count(filter.mask, filter.mask_bits);
+            let scan_len = crds
+                .read()
+                .filter_bitmask_scan_count(filter.mask, filter.mask_bits);
             // Charge only requests that passed cheaper pre-scan checks.
             if !try_consume_scan_budget(request, scan_len) {
                 return Vec::default();
             }
             let caller_wallclock = caller_wallclock.checked_add(jitter).unwrap_or(0);
-            let pred = |entry: &&VersionedCrdsValue| {
-                debug_assert!(filter.test_mask(entry.value.hash()));
+            // Copy only metadata for Bloom tests. Payloads are copied after
+            // their hashes pass the filter, and only if they are still current.
+            let mut candidates = Vec::with_capacity(scan_len);
+            {
+                let crds = crds.read();
+                // Budget consumption can release CRDS to concurrent writers.
+                // Drop a growing bucket rather than scan more than was charged.
+                if crds.filter_bitmask_scan_count(filter.mask, filter.mask_bits) > scan_len {
+                    return Vec::default();
+                }
+                candidates.extend(crds.filter_bitmask(filter.mask, filter.mask_bits).map(
+                    |entry| {
+                        (
+                            entry.value.label(),
+                            *entry.value.hash(),
+                            entry.value.wallclock(),
+                        )
+                    },
+                ));
+            }
+            let mut candidates = candidates.into_iter().filter(|(_, hash, wallclock)| {
+                debug_assert!(filter.test_mask(hash));
                 // Skip values that are too new.
-                if entry.value.wallclock() > caller_wallclock {
+                if *wallclock > caller_wallclock {
                     total_skipped += 1;
                     false
                 } else {
-                    !filter.filter_contains(entry.value.hash())
-                        && should_retain_crds_value(&entry.value)
+                    !filter.filter_contains(hash)
                 }
-            };
-            let out: Vec<_> = crds
-                .filter_bitmask(filter.mask, filter.mask_bits)
-                .filter(pred)
-                .map(|entry| entry.value.clone())
-                .take(output_size_limit)
-                .collect();
+            });
+            let mut out = Vec::new();
+            let mut values = Vec::with_capacity(LOCK_CHUNK_SIZE.min(output_size_limit));
+            while out.len() < output_size_limit {
+                let labels: ArrayVec<_, LOCK_CHUNK_SIZE> = candidates
+                    .by_ref()
+                    .take(LOCK_CHUNK_SIZE.min(output_size_limit - out.len()))
+                    .collect();
+                if labels.is_empty() {
+                    break;
+                }
+                {
+                    let crds = crds.read();
+                    values.extend(labels.iter().filter_map(|(label, hash, _)| {
+                        let value = crds.get::<&CrdsValue>(label)?;
+                        (value.hash() == hash).then(|| value.clone())
+                    }));
+                }
+                out.extend(values.drain(..).filter(&should_retain_crds_value));
+            }
             output_size_limit = output_size_limit.saturating_sub(out.len());
             out
         };
@@ -767,7 +801,7 @@ pub(crate) mod tests {
         solana_packet::PACKET_DATA_SIZE,
         solana_sha256_hasher::hash,
         solana_time_utils::timestamp,
-        std::{net::Ipv4Addr, time::Instant},
+        std::{cell::Cell, net::Ipv4Addr, time::Instant},
         test_case::test_case,
     };
 
@@ -1188,6 +1222,100 @@ pub(crate) mod tests {
         .filter(|peer| peer != old)
         .count();
         assert!(count < 75, "count of peer != old: {count}");
+    }
+
+    #[test]
+    fn test_generate_pull_responses_budget_outside_crds() {
+        let now = timestamp();
+        let crds = RwLock::new(Crds::default());
+        let value = CrdsValue::new_unsigned(CrdsData::from(ContactInfo::new_localhost(
+            &Pubkey::new_unique(),
+            now,
+        )));
+        crds.write()
+            .insert(value, now, GossipRoute::LocalMessage)
+            .unwrap();
+        let request = PullRequest {
+            pubkey: Pubkey::new_unique(),
+            addr: SocketAddr::from(([127, 0, 0, 1], 9000)),
+            wallclock: now,
+            filter: CrdsFilter::new_rand(1, PACKET_DATA_SIZE),
+        };
+        let calls = Cell::new(0);
+        let output = CrdsGossipPull::generate_pull_responses(
+            &crds,
+            &[request],
+            10,
+            now,
+            |_| panic!("scanned a bucket beyond its charged budget"),
+            |_, scan_len| {
+                calls.set(calls.get() + 1);
+                assert_eq!(scan_len, 1);
+                let value = CrdsValue::new_unsigned(CrdsData::from(ContactInfo::new_localhost(
+                    &Pubkey::new_unique(),
+                    now,
+                )));
+                crds.try_write()
+                    .expect("budget callback holds CRDS")
+                    .insert(value, now, GossipRoute::LocalMessage)
+                    .unwrap();
+                true
+            },
+            &GossipStats::default(),
+        );
+        assert_eq!(calls.get(), 1);
+        assert_eq!(output, vec![Vec::<CrdsValue>::new()]);
+    }
+
+    #[test]
+    fn test_generate_pull_responses_matches_filter_and_limit() {
+        let now = timestamp();
+        let mut table = Crds::default();
+        let mut filter = CrdsFilter::new_rand(1, PACKET_DATA_SIZE);
+        for ix in 0..5 * LOCK_CHUNK_SIZE {
+            let wallclock = if ix % 7 == 0 {
+                now + 2 * CRDS_GOSSIP_PULL_CRDS_TIMEOUT_MS
+            } else {
+                now
+            };
+            let value = CrdsValue::new_unsigned(CrdsData::from(ContactInfo::new_localhost(
+                &Pubkey::new_unique(),
+                wallclock,
+            )));
+            if ix % 3 == 0 {
+                filter.add(value.hash());
+            }
+            table.insert(value, now, GossipRoute::LocalMessage).unwrap();
+        }
+        let retain = |value: &CrdsValue| value.pubkey().as_ref()[0] % 2 == 0;
+        let expected: Vec<_> = table
+            .filter_bitmask(filter.mask, filter.mask_bits)
+            .filter(|entry| entry.value.wallclock() <= now)
+            .filter(|entry| !filter.filter_contains(entry.value.hash()) && retain(&entry.value))
+            .take(131)
+            .map(|entry| entry.value.clone())
+            .collect();
+        assert_eq!(expected.len(), 131);
+        let crds = RwLock::new(table);
+        let request = PullRequest {
+            pubkey: Pubkey::new_unique(),
+            addr: SocketAddr::from(([127, 0, 0, 1], 9000)),
+            wallclock: now,
+            filter,
+        };
+        let output = CrdsGossipPull::generate_pull_responses(
+            &crds,
+            &[request],
+            131,
+            now,
+            |value| {
+                assert!(crds.try_write().is_some(), "retention callback holds CRDS");
+                retain(value)
+            },
+            |_, _| true,
+            &GossipStats::default(),
+        );
+        assert_eq!(output, vec![expected]);
     }
 
     #[test]
